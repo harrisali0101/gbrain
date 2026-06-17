@@ -957,16 +957,27 @@ export class PostgresEngine implements BrainEngine {
   }
 
   // Pages CRUD
-  async getPage(slug: string, opts?: { sourceId?: string; includeDeleted?: boolean }): Promise<Page | null> {
+  async getPage(slug: string, opts?: { sourceId?: string; sourceIds?: string[]; includeDeleted?: boolean }): Promise<Page | null> {
     const includeDeleted = opts?.includeDeleted === true;
     const sourceId = opts?.sourceId;
+    const sourceIds = opts?.sourceIds;
     // RLS scope binding (opt-in via GBRAIN_RLS_SCOPE_BINDING): when enabled,
     // wraps the query in a transaction that sets `app.scopes` from the
-    // sourceId opt; when disabled, it's a pass-through.
-    return await this.withScopedReadTransaction(undefined, sourceId, async (tx) => {
+    // sourceIds (federated read) or sourceId (scalar) opt; when disabled,
+    // it's a pass-through. v0.42.36.1: accept sourceIds so OAuth callers
+    // with federated_read can resolve pages across all scopes they own,
+    // matching the precedence ladder in operations.sourceScopeOpts.
+    return await this.withScopedReadTransaction(sourceIds, sourceId, async (tx) => {
       // v0.26.5: default hides soft-deleted rows. Compose with optional sourceId
       // filter via fragment chaining (postgres.js supports sql`` composition).
-      const sourceCondition = sourceId ? tx`AND source_id = ${sourceId}` : tx``;
+      let sourceCondition;
+      if (sourceIds && sourceIds.length > 0) {
+        sourceCondition = tx`AND source_id = ANY(${sourceIds}::text[])`;
+      } else if (sourceId) {
+        sourceCondition = tx`AND source_id = ${sourceId}`;
+      } else {
+        sourceCondition = tx``;
+      }
       const deletedCondition = includeDeleted ? tx`` : tx`AND deleted_at IS NULL`;
       const rows = await tx`
         SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at,

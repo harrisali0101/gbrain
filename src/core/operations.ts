@@ -529,7 +529,14 @@ const get_page: Operation = {
     // resolves to no source), the engine two-branch query falls through to
     // the cross-source view, preserving pre-v0.31.8 behavior. MCP callers
     // (stdio + HTTP) populate ctx.sourceId via the transport layer.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
+    //
+    // v0.42.36.1: route through sourceScopeOpts so OAuth callers with
+    // ctx.auth.allowedSources (federated_read) can resolve pages across
+    // every scope they own — the prior scalar-only path silently dropped
+    // the federated array, leaving authenticated agents unable to
+    // get_page rows outside their primary ctx.sourceId. The fuzzy
+    // fallback below already used sourceScopeOpts; this fixes the drift.
+    const sourceOpts = sourceScopeOpts(ctx);
     // v0.41.13 #1436: fuzzy resolveSlugs ALSO needs source scope — pre-fix
     // it was unscoped, so a remote `get_page` with `fuzzy: true` could
     // return candidates from sources outside ctx.auth.allowedSources /

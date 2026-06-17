@@ -330,6 +330,15 @@ export interface PageFilters {
 export interface GetPageOpts {
   /** Filter to a specific source. When omitted, getPage returns the first slug match across sources (pre-existing semantics). */
   sourceId?: string;
+  /**
+   * v0.42.36.1 — federated read scope. When set (non-empty array), getPage
+   * resolves slugs across every listed source via `source_id = ANY($sourceIds)`.
+   * Used by OAuth callers whose `ctx.auth.allowedSources` spans multiple
+   * scopes (e.g. super_admin-agent with federated_read = [super_admin,
+   * leadership, finance, general, ceos]). Takes precedence over `sourceId`
+   * when both are set. Mirrors `sourceScopeOpts(ctx)` in operations.ts.
+   */
+  sourceIds?: string[];
   /** Include soft-deleted pages. Default false. See PageFilters.includeDeleted. */
   includeDeleted?: boolean;
 }

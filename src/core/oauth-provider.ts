@@ -27,6 +27,7 @@ import { hashToken, generateToken, isUndefinedColumnError } from './utils.ts';
 import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError } from './scope.ts';
 import type { AuthInfo as CoreAuthInfo } from './operations.ts';
 import { parseLegacyTokenScope } from './legacy-token-scope.ts';
+import { safeHexEqual } from './timing-safe.ts';
 import type { SqlQuery, SqlValue } from './sql-query.ts';
 export type { SqlQuery, SqlValue };
 
@@ -72,6 +73,72 @@ function pgArray(arr: string[]): string {
  * direct UPDATEs) continue to function. The validator gates new writes
  * ONLY; we don't break operators with hand-edited rows on upgrade.
  */
+/**
+ * RFC 8693 §3 — `subject_token_type` URI values gbrain understands at the
+ * token-exchange grant. A delegator client identifies the subject it is
+ * acting on behalf of by sending one of these in `subject_token_type`.
+ *
+ * - `urn:gbrain:params:oauth:token-type:subject-id` — the `subject_token`
+ *   parameter is the literal opaque subject identifier (e.g., a WhatsApp
+ *   lid, Slack user id, email). Only honored when the calling client is
+ *   registered with `token_exchange_allowed = true` AND the requested
+ *   subject is in its `allowed_subjects` list (or the client is a
+ *   wildcard delegator). This is the "trusted upstream" delegation
+ *   pattern from the MCP literature: the delegator vouches for the
+ *   subject identity it carries, and the brain trusts that assertion
+ *   only because the client is explicitly allow-listed for it.
+ *
+ * Future: a signed-assertion variant (e.g., `urn:ietf:params:oauth:
+ * token-type:jwt`) is a clean extension — same handler, additional
+ * verification on the subject_token before resolving the subject row.
+ */
+export const SUBJECT_TOKEN_TYPE_SUBJECT_ID = 'urn:gbrain:params:oauth:token-type:subject-id';
+
+/**
+ * RFC 8693 §2.1 / §2.2 — `requested_token_type` value gbrain returns.
+ * Always an access token; refresh tokens are intentionally NOT issued
+ * for subject-scoped grants so a compromised delegator can't rotate
+ * indefinitely against a single subject (short-lived only, defense in
+ * depth alongside the calling client's secret).
+ */
+export const ISSUED_TOKEN_TYPE_ACCESS = 'urn:ietf:params:oauth:token-type:access_token';
+
+/**
+ * Typed OAuth error envelope (RFC 6749 §5.2 / RFC 8693 §2.4 vocabulary).
+ *
+ * The `code` is the spec-defined identifier returned on the wire as
+ * `error`. The constructor's `message` is the SAFE-FOR-WIRE description
+ * (no caller input echoed) — surfaced as `error_description`. Callers
+ * that want richer detail for logs should pass `logDetail` separately;
+ * the wire boundary discards it.
+ *
+ * Why this exists: pre-typed-error, throw sites returned bare `Error`
+ * with messages like `Subject not in client's allowed_subjects: ${id}`,
+ * which the serve-http layer string-matched onto status codes. That
+ * leaked caller input into the response body AND was brittle. With
+ * typed errors the dispatch is exhaustive at the type level and the
+ * description is always a fixed safe string.
+ */
+export class OAuthGrantError extends Error {
+  constructor(
+    public readonly code:
+      | 'invalid_request'
+      | 'invalid_client'
+      | 'invalid_grant'
+      | 'invalid_scope'
+      | 'unauthorized_client'
+      | 'unsupported_grant_type'
+      | 'invalid_target',
+    /** Safe-for-wire description. NEVER includes caller-supplied input. */
+    description: string,
+    /** Detailed message for server-side logs ONLY. May include input. */
+    public readonly logDetail?: string,
+  ) {
+    super(description);
+    this.name = 'OAuthGrantError';
+  }
+}
+
 export type TokenEndpointAuthMethod = 'client_secret_post' | 'client_secret_basic' | 'none';
 
 export const ALLOWED_TOKEN_ENDPOINT_AUTH_METHODS = new Set<TokenEndpointAuthMethod>([
@@ -566,14 +633,30 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     // every token verification.
     let oauthRows: Record<string, unknown>[];
     try {
+      // Primary projection (post-v117): includes oauth_tokens.subject_id so
+      // verifyAccessToken can detect token-exchange-minted tokens and
+      // resolve the subject's effective RLS scope below. Pre-v117 brain →
+      // subject_id column missing → falls through to the v61+ projection
+      // (no subject column), which is identical to the previous primary.
       oauthRows = await this.sql`
-        SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name,
-               c.source_id, c.federated_read
+        SELECT t.client_id, t.scopes, t.expires_at, t.resource, t.subject_id,
+               c.client_name, c.source_id, c.federated_read
         FROM oauth_tokens t
         LEFT JOIN oauth_clients c ON c.client_id = t.client_id
         WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
       `;
-    } catch (err) {
+    } catch (errSubject) {
+      if (!isUndefinedColumnError(errSubject, 'subject_id')) throw errSubject;
+      try {
+        // v61+ projection (pre-v117, has federated_read but no subject_id).
+        oauthRows = await this.sql`
+          SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name,
+                 c.source_id, c.federated_read
+          FROM oauth_tokens t
+          LEFT JOIN oauth_clients c ON c.client_id = t.client_id
+          WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
+        `;
+      } catch (err) {
       // v0.34.1: pre-v60 brain → source_id column missing. Pre-v61 brain →
       // federated_read column missing. Both classes degrade to legacy
       // projection so auth keeps working until the operator runs
@@ -605,6 +688,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         throw err;
       }
     }
+    }
 
     if (oauthRows.length > 0) {
       const row = oauthRows[0];
@@ -615,6 +699,50 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       if (expiresAt === undefined || expiresAt < now) {
         throw new InvalidTokenError('Token expired');
       }
+
+      // RFC 8693 (v117): token-exchange tokens carry a subject_id. When
+      // set, the effective RLS scope (source_id + allowedSources) comes
+      // from the `subjects` row, NOT the calling client's row. Downstream
+      // consumers (HTTP transport → sourceScopeOpts) read these fields
+      // verbatim — the substitution is invisible to them by design. The
+      // `clientId` in AuthInfo still reflects the calling delegator so
+      // audit logs read "Hermes acting for subject Saad". Soft-deleted
+      // subjects fail closed (treated as unknown).
+      //
+      // Pre-v117 brain: the subject_id column is missing — caught at the
+      // top-level catch in the SELECT above and falls through to the
+      // legacy projection. So we don't need to probe here.
+      const subjectIdRaw = (row as Record<string, unknown>).subject_id;
+      if (typeof subjectIdRaw === 'string' && subjectIdRaw.length > 0) {
+        const subjectRows = await this.sql`
+          SELECT subject_id, display_name, role, source_id, allowed_sources
+          FROM subjects
+          WHERE subject_id = ${subjectIdRaw} AND deleted_at IS NULL
+        `;
+        if (subjectRows.length === 0) {
+          // Subject was deleted after this token was minted. Fail closed —
+          // a compromised delegator should not be able to keep using
+          // tokens it minted for users that have been revoked.
+          throw new InvalidTokenError('Subject revoked');
+        }
+        const sRow = subjectRows[0];
+        const sFederated = sRow.allowed_sources;
+        const sAllowed = Array.isArray(sFederated)
+          ? (sFederated as string[])
+          : undefined;
+        return {
+          token,
+          clientId: row.client_id as string,
+          clientName: (row.client_name as string | null) ?? undefined,
+          scopes: (row.scopes as string[]) || [],
+          expiresAt,
+          resource: row.resource ? new URL(row.resource as string) : undefined,
+          sourceId: (sRow.source_id as string | null) ?? undefined,
+          allowedSources: sAllowed,
+          subjectId: sRow.subject_id as string,
+        } as AuthInfo;
+      }
+
       // v0.34.1 (#876): federated_read normalization. SELECT returns
       // either a JS array (Postgres / PGLite text[] driver mapping) or
       // undefined when the legacy projection ran (pre-v61 brain). Empty
@@ -724,6 +852,59 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
   }
 
   // -------------------------------------------------------------------------
+  // Confidential-client authentication (shared by /token grant handlers)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Resolve + authenticate a confidential OAuth client via its
+   * client_id + client_secret, including the soft-delete probe. Returns
+   * the validated client on success; throws `OAuthGrantError` with
+   * code `'invalid_client'` on every failure mode (unknown client,
+   * public client, wrong secret, revoked client).
+   *
+   * This is the shared building block behind:
+   *   - `verifyConfidentialClientSecret` (legacy public surface; wraps
+   *     to translate OAuthGrantError → plain Error so the auth_code +
+   *     refresh_token handlers' existing string-match dispatch in
+   *     serve-http.ts keeps working)
+   *   - `exchangeSubjectToken` (RFC 8693; uses the typed error directly
+   *     so the wire-boundary dispatch is exhaustive at the type level)
+   *
+   * Constant-time hex compare via safeHexEqual; CWE-208 hardened.
+   */
+  private async _authenticateConfidentialClient(
+    clientId: string,
+    presentedSecret: string,
+  ): Promise<OAuthClientInformationFull> {
+    const client = await this._clientsStore.getClient(clientId);
+    if (!client) throw new OAuthGrantError('invalid_client', 'Invalid client');
+    // Public client (token_endpoint_auth_method='none') — refuses to
+    // use this hash-compare path. PKCE is the canonical surface for
+    // public clients via the SDK.
+    if (client.client_secret === undefined) {
+      throw new OAuthGrantError('invalid_client', 'Invalid client');
+    }
+    const presentedHash = hashToken(presentedSecret);
+    if (!safeHexEqual(client.client_secret, presentedHash)) {
+      throw new OAuthGrantError('invalid_client', 'Invalid client');
+    }
+    // Soft-delete probe. The deleted_at column is recent; pre-migration
+    // brains lack it — tolerate that one specific column-missing error
+    // without swallowing real failures (lock timeouts, auth issues).
+    try {
+      const [revoked] = await this.sql`
+        SELECT deleted_at FROM oauth_clients
+        WHERE client_id = ${clientId} AND deleted_at IS NOT NULL
+      `;
+      if (revoked) throw new OAuthGrantError('invalid_client', 'Client has been revoked');
+    } catch (e) {
+      if (e instanceof OAuthGrantError) throw e;
+      if (!isUndefinedColumnError(e, 'deleted_at')) throw e;
+    }
+    return client;
+  }
+
+  // -------------------------------------------------------------------------
   // Client Credentials (called by custom handler, not SDK)
   // -------------------------------------------------------------------------
 
@@ -744,28 +925,17 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     clientId: string,
     presentedSecret: string,
   ): Promise<OAuthClientInformationFull> {
-    const client = await this._clientsStore.getClient(clientId);
-    if (!client) throw new Error('Invalid client');
-    // Public client — refuse to use this hash-compare path.
-    if (client.client_secret === undefined) {
-      throw new Error('Invalid client');
-    }
-    const presentedHash = hashToken(presentedSecret);
-    // client.client_secret is the stored SHA-256 hash (getClient returns
-    // it as the `client_secret` field per the v0.34.1.0 normalization).
-    // Compare via SHA-256-then-equals; constant-time compare a follow-up.
-    if (client.client_secret !== presentedHash) {
-      throw new Error('Invalid client');
-    }
-    // Soft-delete probe — same shape as exchangeClientCredentials.
+    // Delegate to the shared helper, but translate the typed error to
+    // a plain `Error` so the auth_code + refresh_token /token handlers'
+    // existing string-match dispatch in serve-http.ts keeps working
+    // unchanged. New code (exchangeSubjectToken) consumes the typed
+    // error directly via _authenticateConfidentialClient.
     try {
-      const [revoked] = await this.sql`SELECT deleted_at FROM oauth_clients WHERE client_id = ${clientId} AND deleted_at IS NOT NULL`;
-      if (revoked) throw new Error('Client has been revoked');
+      return await this._authenticateConfidentialClient(clientId, presentedSecret);
     } catch (e) {
-      if (e instanceof Error && e.message === 'Client has been revoked') throw e;
-      if (!isUndefinedColumnError(e, 'deleted_at')) throw e;
+      if (e instanceof OAuthGrantError) throw new Error(e.message);
+      throw e;
     }
-    return client;
   }
 
   async exchangeClientCredentials(
@@ -774,7 +944,14 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     requestedScope?: string,
   ): Promise<OAuthTokens> {
     const client = await this._clientsStore.getClient(clientId);
-    if (!client) throw new Error('Client not found');
+    // v0.43: typed-error migration. Was bare `throw new Error('...')` —
+    // now OAuthGrantError so the cc /token handler can dispatch by code
+    // the same way the token-exchange handler does. Wire descriptions
+    // preserved from the pre-typed-error contract (existing tests pin
+    // to these strings). RFC 6749 §5.2 codes mapped:
+    //   - missing/wrong client / bad secret / revoked → invalid_client
+    //   - grant_type not in client.grant_types → unauthorized_client
+    if (!client) throw new OAuthGrantError('invalid_client', 'Client not found');
 
     // Check if client has been revoked (soft-deleted). The deleted_at column
     // is recent — pre-migration brains don't have it, so the probe must
@@ -782,24 +959,32 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     // (lock timeouts, network blips, auth failures).
     try {
       const [revoked] = await this.sql`SELECT deleted_at FROM oauth_clients WHERE client_id = ${clientId} AND deleted_at IS NOT NULL`;
-      if (revoked) throw new Error('Client has been revoked');
+      if (revoked) throw new OAuthGrantError('invalid_client', 'Client has been revoked');
     } catch (e) {
       // F5 hardening: surface anything that ISN'T a missing-column error.
       // Bare `catch {}` masked DB outages as "client not revoked" — fail-open
       // posture in a security-sensitive code path.
-      if (e instanceof Error && e.message === 'Client has been revoked') throw e;
+      if (e instanceof OAuthGrantError) throw e;
       if (!isUndefinedColumnError(e, 'deleted_at')) throw e;
     }
 
-    // Check grant type first (before verifying secret)
+    // Check grant type first (before verifying secret). RFC 6749 §5.2 —
+    // unauthorized_client = "the authenticated client is not authorized
+    // to use this authorization grant type."
     const grants = (client.grant_types as string[]) || [];
     if (!grants.includes('client_credentials')) {
-      throw new Error('Client credentials grant not authorized for this client');
+      throw new OAuthGrantError(
+        'unauthorized_client',
+        'Client credentials grant not authorized for this client',
+        `client.grant_types=${JSON.stringify(grants)}`,
+      );
     }
 
-    // Verify secret
+    // Verify secret — constant-time hex compare (CWE-208).
     const secretHash = hashToken(clientSecret);
-    if (client.client_secret !== secretHash) throw new Error('Invalid client secret');
+    if (client.client_secret === undefined || !safeHexEqual(client.client_secret, secretHash)) {
+      throw new OAuthGrantError('invalid_client', 'Invalid client secret');
+    }
 
     // Determine scopes. v0.28 swaps exact-string-match for hasScope so a
     // client whose grant is `admin` can mint tokens that include implied
@@ -824,6 +1009,290 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
 
     // Client credentials: access token only, NO refresh token (RFC 6749 4.4.3)
     return this.issueTokens(clientId, grantedScopes, undefined, false, clientTtl);
+  }
+
+  // -------------------------------------------------------------------------
+  // Token Exchange (RFC 8693)
+  // -------------------------------------------------------------------------
+
+  /**
+   * RFC 8693 — exchange a delegator client's credentials for an
+   * access token bound to a specific end-user (subject). The calling
+   * client must be registered with `token_exchange_allowed = true` AND
+   * the requested subject_id must be in its `allowed_subjects` (or the
+   * client is a wildcard delegator via `['*']`).
+   *
+   * The minted token's effective RLS scope is resolved from the subject
+   * row (source_id + allowed_sources), NOT from the calling client's
+   * registration — so a single delegator client serves N end-users at
+   * distinct database-enforced scopes. The calling client's identity is
+   * still recorded in oauth_tokens.client_id for audit ("Hermes acting
+   * for subject Saad").
+   *
+   * Returns access-only — no refresh token. Token-exchange grants are
+   * intended for short-lived per-call delegation; the calling client
+   * uses its own credentials to mint fresh subject tokens as needed.
+   * Per RFC 8693 §2.2.1, the response includes `issued_token_type` and
+   * the scope string honors the requested_scope subset clamped against
+   * the calling client's grant.
+   *
+   * SECURITY: this implements the "trusted upstream" pattern explicitly
+   * called out by the MCP security literature (Solo.io / Microsoft Entra
+   * / AWS Open Protocols). The brain trusts the delegator's assertion
+   * of the subject identity ONLY because the delegator is allow-listed
+   * for it — the assertion itself is unsigned. Future hardening: accept
+   * a signed JWT assertion as `subject_token` when callers prefer
+   * cryptographic non-repudiation over allow-list trust.
+   */
+  async exchangeSubjectToken(
+    clientId: string,
+    clientSecret: string,
+    subjectToken: string,
+    subjectTokenType: string,
+    requestedScope?: string,
+    resource?: URL,
+  ): Promise<OAuthTokens & { issued_token_type: string }> {
+    if (subjectTokenType !== SUBJECT_TOKEN_TYPE_SUBJECT_ID) {
+      // RFC 8693 §2.2.2: unsupported subject_token_type → invalid_request.
+      // Description is a fixed string; the offending value goes only to logs.
+      // subjectTokenType is structural metadata (a URI we publish), NOT an
+      // end-user identifier — safe to log verbatim.
+      throw new OAuthGrantError(
+        'invalid_request',
+        'unsupported subject_token_type',
+        `received subject_token_type=${JSON.stringify(subjectTokenType)}`,
+      );
+    }
+    if (!subjectToken || typeof subjectToken !== 'string') {
+      throw new OAuthGrantError('invalid_request', 'subject_token required');
+    }
+
+    // GDPR Art. 4(1) / EDPB Guidelines 01/2025: WhatsApp lids and similar
+    // subject identifiers are "online identifiers" and personal data. Use
+    // a SHA-256 prefix in logDetail so the raw subject_token never lands
+    // in journal output via the deny-path audit log's `log_detail` field.
+    // Same truncation as the allow-path `subject_id_hash` in serve-http.ts
+    // → key parity across allow + deny logs.
+    const subjectHashForLog = hashToken(subjectToken).slice(0, 16);
+
+    // Resolve + authenticate via the shared confidential-client helper.
+    // Throws OAuthGrantError('invalid_client', ...) on unknown client,
+    // public client, wrong secret, or revoked client.
+    const client = await this._authenticateConfidentialClient(clientId, clientSecret);
+
+    // Delegation gate: the client must be explicitly opted in to
+    // token-exchange AND the subject must be in its allow-list (or
+    // wildcard). Defaults are off-by-default (FALSE / NULL) — a fresh
+    // client registration cannot accidentally delegate.
+    let delegationRows: Record<string, unknown>[];
+    try {
+      delegationRows = await this.sql`
+        SELECT token_exchange_allowed, allowed_subjects
+        FROM oauth_clients
+        WHERE client_id = ${clientId}
+      `;
+    } catch (e) {
+      // Pre-v116 brain: columns missing → delegation impossible until
+      // operator runs apply-migrations. Fail closed with a server-side
+      // hint kept off the wire.
+      if (isUndefinedColumnError(e, 'token_exchange_allowed') || isUndefinedColumnError(e, 'allowed_subjects')) {
+        throw new OAuthGrantError(
+          'invalid_grant',
+          'Token exchange not available on this server',
+          'pre-v116 brain — operator must run gbrain apply-migrations',
+        );
+      }
+      throw e;
+    }
+    if (delegationRows.length === 0 || !delegationRows[0].token_exchange_allowed) {
+      // Distinct from "subject not in allow-list" so operators can tell
+      // the two states apart from server logs (description on the wire
+      // stays generic so we don't reveal config to the caller).
+      throw new OAuthGrantError(
+        'invalid_grant',
+        'token exchange not authorized for this client',
+        'token_exchange_allowed=false on oauth_clients row',
+      );
+    }
+    const allowed = delegationRows[0].allowed_subjects;
+    const allowedList = Array.isArray(allowed) ? (allowed as string[]) : null;
+    if (allowedList === null) {
+      throw new OAuthGrantError(
+        'invalid_grant',
+        'token exchange not authorized for this client',
+        'allowed_subjects=NULL on oauth_clients row (call gbrain auth allow-exchange)',
+      );
+    }
+    const isWildcard = allowedList.includes('*');
+    if (!isWildcard && !allowedList.includes(subjectToken)) {
+      throw new OAuthGrantError(
+        'invalid_grant',
+        'subject not allowed for this client',
+        `subject_id_hash=${subjectHashForLog} not in allowed_subjects`,
+      );
+    }
+
+    // Look up the subject. Must exist + not be soft-deleted.
+    const subjectRows = await this.sql`
+      SELECT subject_id, source_id, allowed_sources
+      FROM subjects
+      WHERE subject_id = ${subjectToken} AND deleted_at IS NULL
+    `;
+    if (subjectRows.length === 0) {
+      throw new OAuthGrantError(
+        'invalid_grant',
+        'subject not found',
+        `subject_id_hash=${subjectHashForLog} absent or soft-deleted`,
+      );
+    }
+
+    // Scope clamp: requested scope filtered against the calling
+    // client's registered grant. Matches the pattern used by every
+    // other grant in this file (RFC 6749 §6 / §3.3).
+    const allowedScopes = parseScopeString(client.scope);
+    const requestedScopes = requestedScope ? parseScopeString(requestedScope) : allowedScopes;
+    const grantedScopes = requestedScopes.filter(s => hasScope(allowedScopes, s));
+
+    // Issue access-only (no refresh). Short TTL by design — defer to
+    // the calling client to mint fresh tokens per turn. RFC 8707
+    // `resource` is bound onto the token row so the delegator can
+    // request an audience-pinned token (defense against cross-server
+    // replay).
+    const tokens = await this.issueTokens(
+      clientId,
+      grantedScopes,
+      resource,
+      false,
+      undefined,
+      subjectToken,
+    );
+    return {
+      ...tokens,
+      issued_token_type: ISSUED_TOKEN_TYPE_ACCESS,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Subject Registry (RFC 8693 — admin helpers)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Upsert a subject. The minimal CRUD entry point for the subject
+   * registry — CLI (`gbrain auth subjects add`) and admin HTTP routes
+   * call this. Subject IDs are caller-chosen opaque strings; the brain
+   * treats them as keys and never parses semantic meaning, BUT we still
+   * reject a few values at the boundary:
+   *
+   *   - `*` is the wildcard sentinel in `oauth_clients.allowed_subjects`
+   *     — letting it be a real subject_id would shadow the wildcard
+   *     semantics so a wildcard delegator could exchange `subject_token=*`
+   *     and get the literal-* subject's scope.
+   *   - whitespace + control chars break audit-log parsing and risk
+   *     URL/header smuggling at downstream consumers.
+   *   - empty string is meaningless and matches the falsy guard in
+   *     exchangeSubjectToken (would never resolve).
+   *   - length > 256 caps the index footprint on the subjects PK.
+   */
+  async upsertSubject(opts: {
+    subjectId: string;
+    displayName?: string;
+    role?: string;
+    sourceId?: string;
+    allowedSources: string[];
+  }): Promise<void> {
+    const sid = opts.subjectId;
+    if (typeof sid !== 'string' || sid.length === 0 || sid.length > 256) {
+      throw new Error('subject_id must be a non-empty string of <= 256 chars');
+    }
+    if (sid === '*') {
+      throw new Error('subject_id "*" is reserved (wildcard sentinel in allowed_subjects)');
+    }
+    // \s catches ALL whitespace (space, tab, newline); also reject control
+    // chars (\x00-\x1F + \x7F) to keep audit logs / Postgres TEXT[] safe.
+    // eslint-disable-next-line no-control-regex
+    if (/[\s\x00-\x1F\x7F]/.test(sid)) {
+      throw new Error('subject_id must not contain whitespace or control characters');
+    }
+
+    await this.sql`
+      INSERT INTO subjects (subject_id, display_name, role, source_id, allowed_sources, updated_at)
+      VALUES (${opts.subjectId}, ${opts.displayName ?? null}, ${opts.role ?? null},
+              ${opts.sourceId ?? null}, ${pgArray(opts.allowedSources)}, now())
+      ON CONFLICT (subject_id) DO UPDATE
+      SET display_name = EXCLUDED.display_name,
+          role = EXCLUDED.role,
+          source_id = EXCLUDED.source_id,
+          allowed_sources = EXCLUDED.allowed_sources,
+          updated_at = now(),
+          deleted_at = NULL
+    `;
+  }
+
+  /**
+   * Soft-delete a subject. Tokens already minted for this subject_id
+   * become invalid at verifyAccessToken time (the JOIN on subjects
+   * with `deleted_at IS NULL` returns zero rows → InvalidTokenError).
+   * Hard-delete is left as a future explicit op so admins don't lose
+   * audit history.
+   */
+  async deleteSubject(subjectId: string): Promise<void> {
+    await this.sql`UPDATE subjects SET deleted_at = now() WHERE subject_id = ${subjectId}`;
+  }
+
+  async listSubjects(): Promise<Array<{
+    subject_id: string;
+    display_name: string | null;
+    role: string | null;
+    source_id: string | null;
+    allowed_sources: string[];
+  }>> {
+    const rows = await this.sql`
+      SELECT subject_id, display_name, role, source_id, allowed_sources
+      FROM subjects
+      WHERE deleted_at IS NULL
+      ORDER BY subject_id
+    `;
+    return rows as Array<{
+      subject_id: string;
+      display_name: string | null;
+      role: string | null;
+      source_id: string | null;
+      allowed_sources: string[];
+    }>;
+  }
+
+  /**
+   * Toggle the token-exchange delegation flag on an existing OAuth
+   * client and set its allow-list. Pass `subjects: ['*']` for a
+   * wildcard delegator (e.g., the multi-tenant WhatsApp gateway);
+   * pass `subjects: []` to revoke delegation while leaving the client
+   * otherwise intact.
+   *
+   * Hard cap at 10,000 entries — beyond that the per-exchange
+   * `allowedList.includes(subjectToken)` becomes O(n) on a hot path
+   * and a compromised admin could DoS the brain by setting a huge
+   * allow-list. Operators with more than 10k subjects should be
+   * using a wildcard delegator + relying on the `subjects` table
+   * filter instead.
+   *
+   * Returns true if exactly one row was updated; false when no client
+   * matched (typo path). Callers should error on false rather than
+   * silently reporting success — see auth.ts allow-exchange CLI for
+   * the canonical handling.
+   */
+  async allowClientExchange(clientId: string, subjects: string[]): Promise<boolean> {
+    if (subjects.length > 10_000) {
+      throw new Error('allowed_subjects exceeds maximum of 10000 entries; use a wildcard delegator instead');
+    }
+    const enabled = subjects.length > 0;
+    const rows = await this.sql`
+      UPDATE oauth_clients
+      SET token_exchange_allowed = ${enabled},
+          allowed_subjects = ${enabled ? pgArray(subjects) : null}
+      WHERE client_id = ${clientId}
+      RETURNING client_id
+    `;
+    return rows.length > 0;
   }
 
   // -------------------------------------------------------------------------
@@ -950,6 +1419,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     resource: URL | undefined,
     includeRefresh: boolean,
     ttlOverride?: number,
+    subjectId?: string,
   ): Promise<OAuthTokens> {
     const accessToken = generateToken('gbrain_at_');
     const accessHash = hashToken(accessToken);
@@ -957,11 +1427,28 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     const effectiveTtl = ttlOverride || this.tokenTtl;
     const accessExpiry = now + effectiveTtl;
 
-    await this.sql`
-      INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at, resource)
-      VALUES (${accessHash}, ${'access'}, ${clientId},
-              ${pgArray(scopes)}, ${accessExpiry}, ${resource?.toString() || null})
-    `;
+    // RFC 8693 (v117): persist subject_id on the access row when this
+    // is a token-exchange grant. verifyAccessToken keys off this column
+    // to resolve the subject's RLS scope at lookup time. Pre-v117 brain
+    // → INSERT fails on the unknown column → fall back to the legacy
+    // INSERT and skip the subject binding (the calling client's static
+    // scope applies, mirroring pre-RFC8693 behavior).
+    try {
+      await this.sql`
+        INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at, resource, subject_id)
+        VALUES (${accessHash}, ${'access'}, ${clientId},
+                ${pgArray(scopes)}, ${accessExpiry}, ${resource?.toString() || null},
+                ${subjectId ?? null})
+      `;
+    } catch (err) {
+      if (subjectId !== undefined) throw err;
+      if (!isUndefinedColumnError(err, 'subject_id')) throw err;
+      await this.sql`
+        INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at, resource)
+        VALUES (${accessHash}, ${'access'}, ${clientId},
+                ${pgArray(scopes)}, ${accessExpiry}, ${resource?.toString() || null})
+      `;
+    }
 
     const result: OAuthTokens = {
       access_token: accessToken,
@@ -975,6 +1462,11 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       const refreshHash = hashToken(refreshToken);
       const refreshExpiry = now + this.refreshTtl;
 
+      // Refresh rows never carry subject_id — token-exchange grants
+      // are access-only by design (see exchangeSubjectToken docstring).
+      // If a non-exchange grant is somehow refresh-issued with subjectId
+      // set, the value silently drops here; that's a caller bug we don't
+      // mask. The pre-v117 fallback applies only to the access INSERT.
       await this.sql`
         INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at, resource)
         VALUES (${refreshHash}, ${'refresh'}, ${clientId},

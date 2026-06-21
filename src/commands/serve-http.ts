@@ -25,8 +25,9 @@ import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middlew
 import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
-import { GBrainOAuthProvider, validateTokenEndpointAuthMethod } from '../core/oauth-provider.ts';
+import { GBrainOAuthProvider, validateTokenEndpointAuthMethod, OAuthGrantError } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
+import { hashToken } from '../core/utils.ts';
 import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
 import { summarizeMcpParams, dispatchToolCall } from '../mcp/dispatch.ts';
 import { paramDefToSchema } from '../mcp/tool-defs.ts';
@@ -580,6 +581,71 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     message: { error: 'too_many_requests', error_description: 'Rate limit exceeded. Try again in 15 minutes.' },
   });
 
+  // RFC 8693 token-exchange limiter — keyed per `client_id` (not per IP),
+  // Single Basic-auth parser — reused by the exchange rate limiter's
+  // keyGenerator AND by the exchange + auth_code/refresh handlers below.
+  // Centralizing keeps the limiter's bucket-key derivation in lockstep
+  // with the credential extraction that actually authenticates, so a
+  // future tweak (e.g. trimming whitespace) can't silently desync.
+  // Returns the decoded (client_id, client_secret) pair or null when
+  // the header is absent, malformed, or doesn't carry a colon.
+  const parseBasicAuth = (authHeader: string | undefined | null): { clientId: string; secret: string } | null => {
+    if (!authHeader || !authHeader.startsWith('Basic ')) return null;
+    try {
+      const decoded = Buffer.from(authHeader.slice('Basic '.length), 'base64').toString('utf8');
+      const idx = decoded.indexOf(':');
+      if (idx < 0) return null;
+      return {
+        clientId: decodeURIComponent(decoded.slice(0, idx)),
+        secret: decodeURIComponent(decoded.slice(idx + 1)),
+      };
+    } catch {
+      // Malformed base64 or %-encoded segment → caller falls back.
+      return null;
+    }
+  };
+
+  // because the multi-tenant gateway use case has many subjects sharing
+  // one delegator client and one egress IP. The ccRateLimiter's 50/15min
+  // cap would lock out a busy WhatsApp gateway in well under a window;
+  // a per-client cap of 600/min supports ~10 turns/sec sustained while
+  // still flagging credential-stuffing. Falls back to IP when the client_id
+  // can't be derived (malformed request → SDK rejects below anyway).
+  const exchangeRateLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 600,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req: Request) => {
+      const bodyClientId = typeof (req.body as any)?.client_id === 'string'
+        ? (req.body as any).client_id as string
+        : undefined;
+      if (bodyClientId) return `exchange:${bodyClientId}`;
+      const basic = parseBasicAuth((req.headers.authorization ?? '').toString());
+      if (basic) return `exchange:${basic.clientId}`;
+      return `exchange:ip:${req.ip || 'unknown'}`;
+    },
+    message: { error: 'too_many_requests', error_description: 'Token-exchange rate limit exceeded for this client.' },
+  });
+
+  // Secondary per-IP cap chained UNDER exchangeRateLimiter — closes the
+  // attack where an anonymous attacker spoofs `client_id=victim_id` in
+  // the body to consume the victim's per-client bucket. With this in
+  // place, a single IP cannot exhaust more than 1200 token-exchange
+  // calls/min regardless of which client_id values it claims; only the
+  // legitimate delegator's egress IP can drive sustained traffic at
+  // ~10/sec. Per-IP cap is 2× the per-client cap so a real delegator
+  // with bursty traffic across multiple agents isn't false-positively
+  // blocked. CWE-799 mitigation.
+  const exchangeIpLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 1200,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req: Request) => `exchange-ip:${req.ip || 'unknown'}`,
+    message: { error: 'too_many_requests', error_description: 'Token-exchange rate limit exceeded for this IP.' },
+  });
+
   // Magic-link rate limiter: 10 requests/min/IP. The bootstrap token is
   // 64-char hex (unguessable) so brute-forcing is computationally
   // infeasible — but a misconfigured client looping on /admin/auth/:bad
@@ -593,7 +659,41 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     message: 'Too many magic-link attempts. Wait a minute before trying again.',
   });
 
-  app.post('/token', ccRateLimiter, express.urlencoded({ extended: false }), async (req, res, next) => {
+  // RFC 8693 token-exchange grant URI — declared up here so the rate-limit
+  // dispatcher below can branch on it before the dedicated handler runs.
+  const TOKEN_EXCHANGE_GRANT = 'urn:ietf:params:oauth:grant-type:token-exchange';
+
+  // Single up-front middleware layer for /token: parse the body ONCE
+  // and apply the right rate limiter ONCE per request. The subsequent
+  // grant-specific handlers do NOT re-install the body parser or any
+  // limiter — that avoids the bug where a request that falls through
+  // multiple Layer middleware chains hits ccRateLimiter twice (or
+  // worse: a token-exchange request would burn the cc-limiter's counter
+  // before even reaching the exchange handler).
+  const tokenBodyParser = express.urlencoded({ extended: false });
+  const tokenRateLimitDispatcher: import('express').RequestHandler = (req, res, next) => {
+    if (req.body?.grant_type === TOKEN_EXCHANGE_GRANT) {
+      // Chain per-IP cap FIRST (prevents anonymous spoofing of victim
+      // client_id), then per-client cap. Both must pass for the request
+      // to proceed. If either rejects, it sends the 429 and never invokes
+      // next, so this short-circuits cleanly.
+      return exchangeIpLimiter(req, res, (err) => {
+        if (err) return next(err);
+        return exchangeRateLimiter(req, res, next);
+      });
+    }
+    // client_credentials, authorization_code, refresh_token, or unknown
+    // (unknown still hits the cc-limiter — same pre-RFC8693 behavior).
+    return ccRateLimiter(req, res, next);
+  };
+  // Layer 0: body parser + rate-limit dispatcher only. No terminal
+  // handler — when both middlewares call next() the request falls
+  // through to the next matching POST /token route below. `app.use`
+  // would be even tighter but it matches OPTIONS too, and CORS already
+  // owns the preflight at line 536.
+  app.post('/token', tokenBodyParser, tokenRateLimitDispatcher);
+
+  app.post('/token', async (req, res, next) => {
     if (req.body?.grant_type !== 'client_credentials') {
       return next(); // Fall through to confidential-client handler or SDK
     }
@@ -608,8 +708,179 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const tokens = await oauthProvider.exchangeClientCredentials(client_id, client_secret, scope);
       res.json(tokens);
     } catch (e) {
+      // Typed-error dispatch (same shape as the token-exchange handler).
+      // RFC 6749 §5.2: invalid_client → 401, everything else → 400. The
+      // wire description always comes from OAuthGrantError.message which
+      // is a fixed safe string; logDetail (operator-only) keeps the
+      // verbose parameterized context.
+      if (e instanceof OAuthGrantError) {
+        const status = e.code === 'invalid_client' ? 401 : 400;
+        res.status(status).json({ error: e.code, error_description: e.message });
+        return;
+      }
       const msg = e instanceof Error ? e.message : 'Unknown error';
-      res.status(400).json({ error: 'invalid_grant', error_description: msg });
+      console.error('client_credentials unexpected error:', msg);
+      res.status(500).json({ error: 'server_error', error_description: 'internal error' });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // RFC 8693 token-exchange handler. Lives between the client_credentials
+  // handler above and the authorization_code / refresh_token handler below,
+  // because the MCP SDK's router doesn't know this grant — we must terminate
+  // it before mcpAuthRouter sees it (otherwise the SDK returns
+  // unsupported_grant_type).
+  //
+  // Flow: the calling client presents its own credentials AND a `subject_token`
+  // identifying the end-user it is acting for. The brain validates (a) the
+  // client is allow-listed for token-exchange, (b) the subject is in the
+  // client's allow-list or wildcard, (c) the subject row exists. The minted
+  // token's RLS scope comes from the subjects row, NOT the client row —
+  // see exchangeSubjectToken in src/core/oauth-provider.ts for the security
+  // posture rationale.
+  // ---------------------------------------------------------------------------
+  // Body parsing + rate limiting both happen in the up-front /token
+  // middleware layer above; this handler only registers the
+  // grant-specific logic.
+  app.post('/token', async (req, res, next) => {
+    if (req.body?.grant_type !== TOKEN_EXCHANGE_GRANT) {
+      return next();
+    }
+    try {
+      // Confidential auth only — public clients (PKCE-only) cannot
+      // delegate. Accept client_secret via body OR Authorization: Basic
+      // (parallel to the auth_code/refresh handler below). RFC 8693 §2.1
+      // does not mandate either; we accept both for ergonomic parity
+      // with the existing grants.
+      let clientId: string | undefined = req.body?.client_id;
+      let presentedSecret: string | undefined = req.body?.client_secret;
+      if (!presentedSecret) {
+        const basic = parseBasicAuth((req.headers.authorization ?? '').toString());
+        if (basic) {
+          clientId ||= basic.clientId;
+          presentedSecret = basic.secret;
+        }
+      }
+      if (!clientId || !presentedSecret) {
+        res.status(401).json({ error: 'invalid_client', error_description: 'client_id and client_secret required' });
+        return;
+      }
+
+      const subjectToken: string | undefined = req.body?.subject_token;
+      const subjectTokenType: string | undefined = req.body?.subject_token_type;
+      if (!subjectToken || !subjectTokenType) {
+        res.status(400).json({ error: 'invalid_request', error_description: 'subject_token and subject_token_type required' });
+        return;
+      }
+
+      // RFC 8693 §2.1: `requested_token_type` is OPTIONAL; when present,
+      // the server MUST honor it or return invalid_request. gbrain only
+      // issues opaque access tokens, so any explicit value other than
+      // `urn:ietf:params:oauth:token-type:access_token` is unhonorable —
+      // fail loud rather than silently switch types under the caller.
+      const requestedTokenType: string | undefined = req.body?.requested_token_type;
+      if (requestedTokenType !== undefined &&
+          requestedTokenType !== 'urn:ietf:params:oauth:token-type:access_token') {
+        res.status(400).json({
+          error: 'invalid_request',
+          error_description: 'requested_token_type must be urn:ietf:params:oauth:token-type:access_token',
+        });
+        return;
+      }
+
+      // RFC 8693 §2.1: `audience` is a logical-name binding (distinct
+      // from `resource`, which is a URI). gbrain currently only honors
+      // `resource`; silently dropping `audience` would issue a token
+      // the caller believes is audience-bound when it isn't. Return
+      // invalid_target so callers know to migrate to `resource=`.
+      if (req.body?.audience !== undefined) {
+        res.status(400).json({
+          error: 'invalid_target',
+          error_description: 'audience parameter not supported; use resource',
+        });
+        return;
+      }
+
+      const scope: string | undefined = typeof req.body?.scope === 'string' ? req.body.scope : undefined;
+
+      // RFC 8707 audience binding via `resource=<uri>`. The delegator MAY
+      // pin the issued token to a specific upstream. Validation per §2:
+      //   • MUST be a parseable URI → otherwise invalid_target
+      //   • MUST NOT contain a fragment component
+      //   • SHOULD NOT contain a query component (we accept but warn)
+      let resource: URL | undefined;
+      if (typeof req.body?.resource === 'string' && req.body.resource.length > 0) {
+        try {
+          resource = new URL(req.body.resource);
+        } catch {
+          res.status(400).json({ error: 'invalid_target', error_description: 'resource is not a valid URI' });
+          return;
+        }
+        if (resource.hash) {
+          // RFC 8707 §2 MUST-NOT: fragment in a resource URI is a hard reject.
+          res.status(400).json({
+            error: 'invalid_target',
+            error_description: 'resource MUST NOT contain a fragment (RFC 8707 §2)',
+          });
+          return;
+        }
+      }
+
+      const tokens = await oauthProvider.exchangeSubjectToken(
+        clientId,
+        presentedSecret,
+        subjectToken,
+        subjectTokenType,
+        scope,
+        resource,
+      );
+      // Structured audit log: one line per successful exchange so SOC2 /
+      // ISO27001-style reviews can trace every token-mint to (delegator,
+      // subject, scope, resource, source IP). subject_id is SHA-256-hashed
+      // because WhatsApp lids are GDPR "online identifiers" (EDPB
+      // Guidelines 01/2025).
+      console.log(JSON.stringify({
+        event: 'oauth.token_exchange',
+        client_id: clientId,
+        subject_id_hash: hashToken(subjectToken).slice(0, 16),
+        requested_scope: scope ?? null,
+        issued_scope: tokens.scope ?? null,
+        resource: resource?.toString() ?? null,
+        source_ip: req.ip ?? null,
+        decision: 'allow',
+      }));
+      res.json(tokens);
+    } catch (e) {
+      // Typed OAuthGrantError carries the safe-for-wire description in
+      // `message` and the verbose context in `logDetail`. We log the
+      // verbose form for operator debugging and return the safe form
+      // on the wire — never echo caller input back to the caller.
+      if (e instanceof OAuthGrantError) {
+        const status = e.code === 'invalid_client' ? 401 : 400;
+        // Deny-path audit row mirrors the allow-path shape (key parity
+        // so log pipelines don't need two schemas). The hashed subject
+        // id appears on deny too — SOC2-style traces need "who was the
+        // gateway trying to act for when we denied" as much as the
+        // allow case. Null when the caller never sent a subject_token
+        // (shape-error path).
+        const deniedSubject = typeof req.body?.subject_token === 'string'
+          ? req.body.subject_token
+          : null;
+        console.log(JSON.stringify({
+          event: 'oauth.token_exchange',
+          client_id: req.body?.client_id ?? null,
+          subject_id_hash: deniedSubject ? hashToken(deniedSubject).slice(0, 16) : null,
+          source_ip: req.ip ?? null,
+          decision: 'deny',
+          error_code: e.code,
+          log_detail: e.logDetail ?? e.message,
+        }));
+        res.status(status).json({ error: e.code, error_description: e.message });
+        return;
+      }
+      const msg = e instanceof Error ? e.message : 'Unknown error';
+      console.error('token-exchange unexpected error:', msg);
+      res.status(500).json({ error: 'server_error', error_description: 'internal error' });
     }
   });
 
@@ -624,7 +895,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // Public clients (token_endpoint_auth_method='none') fall through to
   // the SDK's handler — the v0.34.1.0 PKCE path stays canonical.
   // ---------------------------------------------------------------------------
-  app.post('/token', ccRateLimiter, async (req, res, next) => {
+  // Body parsing + rate limiting are applied in the up-front /token
+  // middleware layer; this handler only owns the grant-specific logic.
+  app.post('/token', async (req, res, next) => {
     const grantType = req.body?.grant_type;
     if (grantType !== 'authorization_code' && grantType !== 'refresh_token') {
       return next();
@@ -633,20 +906,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     // Detect confidential auth: either client_secret in body
     // (client_secret_post) OR Authorization: Basic header
     // (client_secret_basic). Public PKCE clients omit both.
-    const bodySecret: string | undefined = req.body?.client_secret;
     let clientId: string | undefined = req.body?.client_id;
-    let presentedSecret: string | undefined = bodySecret;
-    const authHeader = (req.headers.authorization ?? '').toString();
-    if (!presentedSecret && authHeader.startsWith('Basic ')) {
-      try {
-        const decoded = Buffer.from(authHeader.slice('Basic '.length), 'base64').toString('utf8');
-        const idx = decoded.indexOf(':');
-        if (idx > -1) {
-          clientId ||= decodeURIComponent(decoded.slice(0, idx));
-          presentedSecret = decodeURIComponent(decoded.slice(idx + 1));
-        }
-      } catch {
-        // Malformed Basic header → falls through; SDK will reject
+    let presentedSecret: string | undefined = req.body?.client_secret;
+    if (!presentedSecret) {
+      const basic = parseBasicAuth((req.headers.authorization ?? '').toString());
+      if (basic) {
+        clientId ||= basic.clientId;
+        presentedSecret = basic.secret;
       }
     }
     if (!clientId || !presentedSecret) {
@@ -737,6 +1003,22 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       (res as any).json = (body: any) => {
         if (body?.grant_types_supported && !body.grant_types_supported.includes('client_credentials')) {
           body.grant_types_supported.push('client_credentials');
+        }
+        // RFC 8693: advertise token-exchange so OAuth-aware clients can
+        // discover the grant via the canonical metadata endpoint. Off-by-
+        // default at the per-client level (token_exchange_allowed=FALSE);
+        // advertising it here just says "the server speaks this grant".
+        if (body?.grant_types_supported && !body.grant_types_supported.includes(TOKEN_EXCHANGE_GRANT)) {
+          body.grant_types_supported.push(TOKEN_EXCHANGE_GRANT);
+        }
+        // RFC 8693 has no IANA-registered metadata field for the supported
+        // subject_token_types, but the de-facto community convention
+        // (Keycloak, ory/hydra) is `subject_token_types_supported`. Adding
+        // it here lets integrators discover the gbrain-namespaced URN
+        // without having to read the docs. Keep this in sync with the
+        // SUBJECT_TOKEN_TYPE_SUBJECT_ID constant in oauth-provider.ts.
+        if (body && !body.subject_token_types_supported) {
+          body.subject_token_types_supported = ['urn:gbrain:params:oauth:token-type:subject-id'];
         }
         return origJson(body);
       };

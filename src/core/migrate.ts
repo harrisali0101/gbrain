@@ -5367,6 +5367,143 @@ export const MIGRATIONS: Migration[] = [
       END $$;
     `,
   },
+  {
+    version: 120,
+    name: 'oauth_clients_token_exchange_columns',
+    // RFC 8693 (OAuth 2.0 Token Exchange) support — gate columns on
+    // oauth_clients. A "delegator" client is one trusted to exchange its
+    // own access token for a downstream token bound to an end-user
+    // (subject). Multi-tenant gateways (WhatsApp / Slack / Teams MCP
+    // bridges) register a single delegator client and the brain enforces
+    // per-user RLS at the SQL layer via the resolved subject's
+    // allowed_sources — NOT the delegator's static federated_read.
+    //
+    //   token_exchange_allowed  — opt-in flag; FALSE on every existing
+    //                             row so the new grant is off-by-default.
+    //   allowed_subjects        — NULL  = no delegation (default)
+    //                             ['*'] = wildcard delegator (any subject)
+    //                             [...] = explicit allow-list of subject_ids
+    //
+    // Keep in sync with src/schema.sql, src/core/pglite-schema.ts,
+    // src/core/schema-embedded.ts.
+    //
+    // Renumbered from v116 to v120 during the 2026-06-24 fork rebase —
+    // upstream took v116/v117/v118/v119 in v0.42.41.0/v0.42.43.0/etc
+    // between our base (v0.42.36.0) and HEAD (v0.42.52.0).
+    idempotent: true,
+    sql: `
+      ALTER TABLE oauth_clients
+        ADD COLUMN IF NOT EXISTS token_exchange_allowed BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE oauth_clients
+        ADD COLUMN IF NOT EXISTS allowed_subjects TEXT[];
+    `,
+  },
+  {
+    version: 121,
+    name: 'subjects_table_and_oauth_tokens_subject_id',
+    // RFC 8693 — subject registry. Each row is an end-user (or
+    // service-on-behalf-of-user) whose effective RLS scope is resolved
+    // dynamically at token-exchange time, NOT carried by the calling
+    // OAuth client. Lets a single delegator client serve N end-users
+    // without holding all-access ("god-mode") credentials — the
+    // confused-deputy anti-pattern explicitly called out by the MCP
+    // security literature (Solo.io / Microsoft Entra / AWS Open
+    // Protocols).
+    //
+    //   subject_id       — opaque, caller-chosen identifier (e.g.
+    //                      WhatsApp wa_id, Slack user id, email)
+    //   display_name     — human label (audit logs / admin UI)
+    //   role             — free-form role tag; advisory only,
+    //                      enforcement is via source_id + allowed_sources
+    //   source_id        — subject's write-source scope (mirrors
+    //                      oauth_clients.source_id semantics)
+    //   allowed_sources  — subject's read-source array (mirrors
+    //                      oauth_clients.federated_read semantics)
+    //
+    // oauth_tokens.subject_id is set ONLY on tokens minted via the
+    // token-exchange grant. verifyAccessToken JOINs subjects when
+    // subject_id is present and resolves source_id + allowed_sources
+    // from the subject row, NOT the client row — so the same delegator
+    // client mints tokens with different RLS scope per subject.
+    //
+    // The partial index on oauth_tokens(subject_id) is split out into
+    // migration v122 below so it can run with CREATE INDEX CONCURRENTLY
+    // on Postgres — oauth_tokens is in the auth hot path on busy brains
+    // and an ACCESS EXCLUSIVE rebuild would stall every login.
+    //
+    // Keep in sync with src/schema.sql, src/core/pglite-schema.ts,
+    // src/core/schema-embedded.ts.
+    //
+    // Renumbered from v117 to v121 during the 2026-06-24 fork rebase.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS subjects (
+        subject_id      TEXT PRIMARY KEY,
+        display_name    TEXT,
+        role            TEXT,
+        source_id       TEXT REFERENCES sources(id) ON DELETE RESTRICT,
+        allowed_sources TEXT[] NOT NULL DEFAULT '{}',
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+        deleted_at      TIMESTAMPTZ
+      );
+      CREATE INDEX IF NOT EXISTS idx_subjects_role ON subjects(role) WHERE deleted_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_subjects_allowed_sources ON subjects USING GIN (allowed_sources);
+      ALTER TABLE oauth_tokens
+        ADD COLUMN IF NOT EXISTS subject_id TEXT;
+    `,
+  },
+  {
+    version: 122,
+    name: 'oauth_tokens_subject_id_partial_index_concurrent',
+    // RFC 8693 follow-up: the partial index on oauth_tokens(subject_id)
+    // is split out from v121 so Postgres can build it CONCURRENTLY
+    // without holding ACCESS EXCLUSIVE on the auth hot path. Mirrors the
+    // pattern v14, v40, v66, etc. use for any new index on a busy table.
+    //
+    // PGLite is single-writer (WASM, no concurrent writes), so the plain
+    // CREATE branch is safe there.
+    //
+    // The pg_index.indisvalid probe drops any leftover invalid index
+    // from a previously-killed CONCURRENTLY build before re-attempting —
+    // identical pattern to migrate.ts:498-516. Idempotent on success;
+    // on a kill mid-build, re-running this migration cleans up + retries.
+    //
+    // Keep in sync with src/schema.sql, src/core/pglite-schema.ts,
+    // src/core/schema-embedded.ts.
+    //
+    // Renumbered from v118 to v122 during the 2026-06-24 fork rebase.
+    idempotent: true,
+    transaction: false,
+    sql: '',
+    handler: async (engine) => {
+      if (engine.kind === 'postgres') {
+        await engine.runMigration(
+          122,
+          `DO $$ BEGIN
+             IF EXISTS (
+               SELECT 1 FROM pg_index i
+               JOIN pg_class c ON c.oid = i.indexrelid
+               WHERE c.relname = 'idx_oauth_tokens_subject' AND NOT i.indisvalid
+             ) THEN
+               EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS idx_oauth_tokens_subject';
+             END IF;
+           END $$;`
+        );
+        await engine.runMigration(
+          122,
+          `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_oauth_tokens_subject
+             ON oauth_tokens(subject_id) WHERE subject_id IS NOT NULL;`
+        );
+      } else {
+        await engine.runMigration(
+          122,
+          `CREATE INDEX IF NOT EXISTS idx_oauth_tokens_subject
+             ON oauth_tokens(subject_id) WHERE subject_id IS NOT NULL;`
+        );
+      }
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

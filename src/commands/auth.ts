@@ -455,6 +455,181 @@ async function registerClient(name: string, args: string[]) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// RFC 8693 — subject registry + delegation CLI
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse `gbrain auth subjects add <id>` flag args. Identical loop pattern to
+ * parseRegisterClientArgs so the two surfaces stay readable side-by-side.
+ */
+interface SubjectArgs {
+  displayName?: string;
+  role?: string;
+  sourceId?: string;
+  allowedSources: string[];
+}
+
+export function parseSubjectArgs(args: string[]): SubjectArgs {
+  const out: SubjectArgs = { allowedSources: [] };
+  let i = 0;
+  while (i < args.length) {
+    const flag = args[i];
+    const value = args[i + 1];
+    const requireValue = () => {
+      if (value === undefined || value.startsWith('--')) {
+        throw new Error(`${flag} requires a value`);
+      }
+      return value;
+    };
+    switch (flag) {
+      case '--name': out.displayName = requireValue(); i += 2; break;
+      case '--role': out.role = requireValue(); i += 2; break;
+      case '--source': out.sourceId = requireValue(); i += 2; break;
+      case '--allowed-sources': {
+        const v = requireValue();
+        out.allowedSources = v.split(',').map(s => s.trim()).filter(Boolean);
+        i += 2; break;
+      }
+      default:
+        throw new Error(`Unknown flag: ${flag}`);
+    }
+  }
+  return out;
+}
+
+async function subjectsAdd(subjectId: string, args: string[]) {
+  if (!subjectId) {
+    console.error('Usage: auth subjects add <subject_id> [--name DISPLAY] [--role ROLE] [--source SOURCE] [--allowed-sources SRC1,SRC2,...]');
+    process.exit(1);
+  }
+  let parsed: SubjectArgs;
+  try {
+    parsed = parseSubjectArgs(args);
+  } catch (e: any) {
+    console.error(`Error: ${e.message}`);
+    process.exit(1);
+  }
+  try {
+    await withConfiguredSql(async (sql) => {
+      const { GBrainOAuthProvider } = await import('../core/oauth-provider.ts');
+      const provider = new GBrainOAuthProvider({ sql });
+      await provider.upsertSubject({
+        subjectId,
+        displayName: parsed.displayName,
+        role: parsed.role,
+        sourceId: parsed.sourceId,
+        allowedSources: parsed.allowedSources,
+      });
+      console.log(`Subject upserted: ${subjectId}`);
+      if (parsed.displayName) console.log(`  Display name:    ${parsed.displayName}`);
+      if (parsed.role)        console.log(`  Role:            ${parsed.role}`);
+      if (parsed.sourceId)    console.log(`  Write source:    ${parsed.sourceId}`);
+      console.log(`  Allowed reads:   ${parsed.allowedSources.join(', ') || '(none)'}`);
+    });
+  } catch (e: any) {
+    console.error('Error:', e.message);
+    process.exit(1);
+  }
+}
+
+async function subjectsList() {
+  try {
+    await withConfiguredSql(async (sql) => {
+      const { GBrainOAuthProvider } = await import('../core/oauth-provider.ts');
+      const provider = new GBrainOAuthProvider({ sql });
+      const rows = await provider.listSubjects();
+      if (rows.length === 0) {
+        console.log('No subjects registered.');
+        return;
+      }
+      for (const r of rows) {
+        console.log(`${r.subject_id}`);
+        if (r.display_name) console.log(`  Display name:  ${r.display_name}`);
+        if (r.role)         console.log(`  Role:          ${r.role}`);
+        if (r.source_id)    console.log(`  Write source:  ${r.source_id}`);
+        console.log(`  Allowed reads: ${(r.allowed_sources || []).join(', ') || '(none)'}`);
+      }
+    });
+  } catch (e: any) {
+    console.error('Error:', e.message);
+    process.exit(1);
+  }
+}
+
+async function subjectsRemove(subjectId: string) {
+  if (!subjectId) {
+    console.error('Usage: auth subjects remove <subject_id>');
+    process.exit(1);
+  }
+  try {
+    await withConfiguredSql(async (sql) => {
+      const { GBrainOAuthProvider } = await import('../core/oauth-provider.ts');
+      const provider = new GBrainOAuthProvider({ sql });
+      await provider.deleteSubject(subjectId);
+      console.log(`Subject removed: ${subjectId}`);
+      console.log('Existing tokens for this subject become invalid at next verify.');
+    });
+  } catch (e: any) {
+    console.error('Error:', e.message);
+    process.exit(1);
+  }
+}
+
+async function allowExchange(clientId: string, args: string[]) {
+  if (!clientId) {
+    console.error('Usage: auth allow-exchange <client_id> --subjects "<sub1,sub2,...>" | --subjects "*" | --revoke');
+    process.exit(1);
+  }
+  let subjects: string[] | null = null;
+  let revoke = false;
+  for (let i = 0; i < args.length; i++) {
+    const flag = args[i];
+    const value = args[i + 1];
+    if (flag === '--subjects') {
+      if (!value || value.startsWith('--')) {
+        console.error('--subjects requires a value (comma-separated list, or "*" for wildcard)');
+        process.exit(1);
+      }
+      subjects = value.split(',').map(s => s.trim()).filter(Boolean);
+      i++;
+    } else if (flag === '--revoke') {
+      revoke = true;
+    } else {
+      console.error(`Unknown flag: ${flag}`);
+      process.exit(1);
+    }
+  }
+  if (!revoke && subjects === null) {
+    console.error('Pass --subjects "<list>" or --revoke');
+    process.exit(1);
+  }
+  try {
+    await withConfiguredSql(async (sql) => {
+      const { GBrainOAuthProvider } = await import('../core/oauth-provider.ts');
+      const provider = new GBrainOAuthProvider({ sql });
+      const ok = await provider.allowClientExchange(clientId, revoke ? [] : (subjects ?? []));
+      if (!ok) {
+        // No row matched the client_id. Mirrors revoke-client's UX
+        // (auth.ts:revokeClient) so typos fail loud instead of
+        // silently reporting "enabled" against a phantom row.
+        console.error(`No client found with id "${clientId}"`);
+        process.exit(1);
+      }
+      if (revoke) {
+        console.log(`Token-exchange delegation revoked for ${clientId}.`);
+      } else if (subjects && subjects.length === 1 && subjects[0] === '*') {
+        console.log(`Wildcard token-exchange enabled for ${clientId} (any subject).`);
+      } else {
+        console.log(`Token-exchange enabled for ${clientId}; allow-list: ${(subjects ?? []).join(', ')}`);
+      }
+    });
+  } catch (e: any) {
+    console.error('Error:', e.message);
+    process.exit(1);
+  }
+}
+
 /**
  * Entry point for the `gbrain auth` CLI subcommand. Also reused by the
  * direct-script path (see bottom of file) so `bun run src/commands/auth.ts`
@@ -497,6 +672,20 @@ export async function runAuth(args: string[]): Promise<void> {
     }
     case 'register-client': await registerClient(rest[0], rest.slice(1)); return;
     case 'revoke-client': await revokeClient(rest[0]); return;
+    case 'subjects': {
+      // RFC 8693 subject registry: add / list / remove / show
+      const sub = rest[0];
+      switch (sub) {
+        case 'add':    await subjectsAdd(rest[1], rest.slice(2)); return;
+        case 'list':   await subjectsList(); return;
+        case 'remove': await subjectsRemove(rest[1]); return;
+        default:
+          console.error('Usage: auth subjects <add|list|remove> ...');
+          process.exit(1);
+      }
+      return;
+    }
+    case 'allow-exchange': await allowExchange(rest[0], rest.slice(1)); return;
     case 'test': {
       const tokenIdx = rest.indexOf('--token');
       const url = rest.find(a => !a.startsWith('--') && a !== rest[tokenIdx + 1]);
@@ -528,6 +717,16 @@ Usage:
      --token-endpoint-auth-method <method>                 (v0.41.3+; client_secret_post | client_secret_basic | none;
                                                             'none' = public PKCE-only client, no secret minted)
   gbrain auth revoke-client <client_id>                   Hard-delete an OAuth 2.1 client (cascades to tokens + codes)
+  gbrain auth subjects add <subject_id> [options]         Register / update a subject for RFC 8693 token-exchange
+     --name "<display>"                                    Human label (audit logs)
+     --role <role>                                         Advisory role tag (e.g. staff, director, ceo)
+     --source <source>                                     Subject's write-source scope
+     --allowed-sources <src1,src2,...>                     Subject's read-source array (RLS enforced at SQL layer)
+  gbrain auth subjects list                                List registered subjects
+  gbrain auth subjects remove <subject_id>                 Soft-delete a subject (invalidates outstanding tokens)
+  gbrain auth allow-exchange <client_id> [options]        Toggle RFC 8693 token-exchange delegation on a client
+     --subjects "<sub1,sub2,...>"                          Allow-list (or "*" for wildcard)
+     --revoke                                              Revoke delegation
   gbrain auth test <url> --token <token>                  Smoke-test a remote MCP server
 `);
   }

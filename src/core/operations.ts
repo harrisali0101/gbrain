@@ -272,6 +272,19 @@ export interface AuthInfo {
    * case (back-compat).
    */
   allowedSources?: string[];
+  /**
+   * RFC 8693 token-exchange (v0.43): subject the caller is acting on
+   * behalf of. Set ONLY on tokens minted via the token-exchange grant
+   * from a delegator client. When present, `sourceId` and `allowedSources`
+   * above were resolved from the `subjects` row (not the calling
+   * `oauth_clients` row) — `clientId` still reflects the calling agent
+   * so audit logs read "Hermes acting for subject Saad".
+   *
+   * Downstream consumers that already use `sourceId` / `allowedSources`
+   * for RLS need no changes — the substitution happens inside
+   * `verifyAccessToken`. `subjectId` exists for audit/observability only.
+   */
+  subjectId?: string;
 }
 
 export interface OperationContext {

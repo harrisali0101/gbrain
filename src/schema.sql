@@ -649,6 +649,11 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
   bound_brain_id          TEXT NULL,
   bound_slug_prefixes     TEXT[] NULL,
   bound_max_concurrent    INTEGER NOT NULL DEFAULT 1,
+  -- RFC 8693 (v116): opt-in token-exchange delegation. token_exchange_allowed
+  -- gates the new grant; allowed_subjects = NULL means "no subjects"; ['*']
+  -- means "any subject"; an explicit list pins delegation to those ids.
+  token_exchange_allowed  BOOLEAN NOT NULL DEFAULT FALSE,
+  allowed_subjects        TEXT[],
   created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 -- v0.34.1 (#861, D13 + #876): source_id is the write-source scope;
@@ -666,11 +671,39 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
   scopes       TEXT[],
   expires_at   BIGINT,
   resource     TEXT,
+  -- RFC 8693 (v117): on-behalf-of subject; NULL on every grant except
+  -- token-exchange. verifyAccessToken resolves effective RLS scope from
+  -- the subjects row when subject_id is set, NOT from the client row.
+  subject_id   TEXT,
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_oauth_tokens_expiry ON oauth_tokens(expires_at);
 CREATE INDEX IF NOT EXISTS idx_oauth_tokens_client ON oauth_tokens(client_id);
+CREATE INDEX IF NOT EXISTS idx_oauth_tokens_subject ON oauth_tokens(subject_id) WHERE subject_id IS NOT NULL;
+
+-- ============================================================
+-- subjects: end-user registry for RFC 8693 token-exchange (v117)
+-- ============================================================
+-- Each row is an end-user (or service-on-behalf-of-user) whose effective
+-- RLS scope is resolved dynamically at token-exchange time. Lets a single
+-- delegator OAuth client serve N end-users without holding all-access
+-- credentials (the confused-deputy anti-pattern).
+--
+-- subject_id is opaque, caller-chosen — examples include WhatsApp lid,
+-- Slack user id, email address. The brain treats it as a string key.
+CREATE TABLE IF NOT EXISTS subjects (
+  subject_id      TEXT PRIMARY KEY,
+  display_name    TEXT,
+  role            TEXT,
+  source_id       TEXT REFERENCES sources(id) ON DELETE RESTRICT,
+  allowed_sources TEXT[] NOT NULL DEFAULT '{}',
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_subjects_role ON subjects(role) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_subjects_allowed_sources ON subjects USING GIN (allowed_sources);
 
 CREATE TABLE IF NOT EXISTS oauth_codes (
   code_hash              TEXT PRIMARY KEY,

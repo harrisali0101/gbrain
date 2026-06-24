@@ -740,7 +740,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
           sourceId: (sRow.source_id as string | null) ?? undefined,
           allowedSources: sAllowed,
           subjectId: sRow.subject_id as string,
-        } as AuthInfo;
+        } as CoreAuthInfo as SdkAuthInfo;
       }
 
       // v0.34.1 (#876): federated_read normalization. SELECT returns

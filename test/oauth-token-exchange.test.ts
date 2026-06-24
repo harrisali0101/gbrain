@@ -67,7 +67,7 @@ async function registerDelegator(opts: {
   allowedSubjects: string[] | null;
 }): Promise<{ clientId: string; clientSecret: string }> {
   const { clientId, clientSecret } = await provider.registerClientManual(
-    opts.name ?? 'hermes-delegator',
+    opts.name ?? 'acme-delegator',
     ['client_credentials', 'urn:ietf:params:oauth:grant-type:token-exchange'],
     opts.scopes ?? 'read',
     [],
@@ -83,10 +83,10 @@ async function registerDelegator(opts: {
 
 describe('exchangeSubjectToken — happy path', () => {
   test('mints an access token bound to the subject, with subject-scoped RLS', async () => {
-    const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: ['saad@lid'] });
+    const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: ['alice-example@lid'] });
     await provider.upsertSubject({
-      subjectId: 'saad@lid',
-      displayName: 'Saad',
+      subjectId: 'alice-example@lid',
+      displayName: 'Alice Example',
       role: 'super_admin',
       sourceId: 'general',
       allowedSources: ['general', 'leadership', 'finance'],
@@ -95,7 +95,7 @@ describe('exchangeSubjectToken — happy path', () => {
     const tokens = await provider.exchangeSubjectToken(
       clientId,
       clientSecret,
-      'saad@lid',
+      'alice-example@lid',
       SUBJECT_TOKEN_TYPE_SUBJECT_ID,
     );
 
@@ -110,7 +110,7 @@ describe('exchangeSubjectToken — happy path', () => {
     // NOT the delegator's. This is the load-bearing assertion.
     const auth = await provider.verifyAccessToken(tokens.access_token);
     expect(auth.clientId).toBe(clientId);                       // delegator preserved
-    expect((auth as any).subjectId).toBe('saad@lid');           // audit trail
+    expect((auth as any).subjectId).toBe('alice-example@lid');           // audit trail
     expect((auth as any).sourceId).toBe('general');             // FROM SUBJECT
     expect((auth as any).allowedSources).toEqual(['general', 'leadership', 'finance']);
   });
@@ -132,13 +132,13 @@ describe('exchangeSubjectToken — happy path', () => {
   test('scope clamp: requested scope outside client grant is dropped', async () => {
     const { clientId, clientSecret } = await registerDelegator({
       scopes: 'read',  // delegator only has read
-      allowedSubjects: ['saad@lid'],
+      allowedSubjects: ['alice-example@lid'],
     });
     await provider.upsertSubject({
-      subjectId: 'saad@lid', sourceId: 'general', allowedSources: ['general'],
+      subjectId: 'alice-example@lid', sourceId: 'general', allowedSources: ['general'],
     });
     const tokens = await provider.exchangeSubjectToken(
-      clientId, clientSecret, 'saad@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID, 'read write admin',
+      clientId, clientSecret, 'alice-example@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID, 'read write admin',
     );
     expect(tokens.scope).toBe('read');               // write/admin filtered out
   });
@@ -149,23 +149,23 @@ describe('exchangeSubjectToken — denial paths', () => {
     const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: null });
     // Subject exists, but client never had allowClientExchange called.
     await provider.upsertSubject({
-      subjectId: 'saad@lid', sourceId: 'general', allowedSources: ['general'],
+      subjectId: 'alice-example@lid', sourceId: 'general', allowedSources: ['general'],
     });
     expect(provider.exchangeSubjectToken(
-      clientId, clientSecret, 'saad@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
+      clientId, clientSecret, 'alice-example@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
     )).rejects.toThrow(/not authorized for token exchange/);
   });
 
   test('subject not in client allow-list → rejected even though it exists in subjects table', async () => {
-    const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: ['only-saad@lid'] });
+    const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: ['only-alice-example@lid'] });
     await provider.upsertSubject({
-      subjectId: 'shahzaib@lid', sourceId: 'general', allowedSources: ['general'],
+      subjectId: 'charlie-example@lid', sourceId: 'general', allowedSources: ['general'],
     });
     // Wire-safe error description is a FIXED lowercase string — caller
     // input is never echoed onto the wire. The verbose context (which
     // subject was rejected) lives in OAuthGrantError.logDetail.
     expect(provider.exchangeSubjectToken(
-      clientId, clientSecret, 'shahzaib@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
+      clientId, clientSecret, 'charlie-example@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
     )).rejects.toThrow(/subject not allowed for this client/);
   });
 
@@ -179,25 +179,25 @@ describe('exchangeSubjectToken — denial paths', () => {
   test('soft-deleted subject is unknown to exchange', async () => {
     const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: ['*'] });
     await provider.upsertSubject({
-      subjectId: 'saad@lid', sourceId: 'general', allowedSources: ['general'],
+      subjectId: 'alice-example@lid', sourceId: 'general', allowedSources: ['general'],
     });
-    await provider.deleteSubject('saad@lid');
+    await provider.deleteSubject('alice-example@lid');
     expect(provider.exchangeSubjectToken(
-      clientId, clientSecret, 'saad@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
+      clientId, clientSecret, 'alice-example@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
     )).rejects.toThrow(/subject not found/);
   });
 
   test('soft-deleted subject also fails verifyAccessToken on tokens already minted', async () => {
     const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: ['*'] });
     await provider.upsertSubject({
-      subjectId: 'saad@lid', sourceId: 'general', allowedSources: ['general'],
+      subjectId: 'alice-example@lid', sourceId: 'general', allowedSources: ['general'],
     });
     const tokens = await provider.exchangeSubjectToken(
-      clientId, clientSecret, 'saad@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
+      clientId, clientSecret, 'alice-example@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
     );
     // Token validates pre-deletion.
     await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeDefined();
-    await provider.deleteSubject('saad@lid');
+    await provider.deleteSubject('alice-example@lid');
     // Same token now fails — load-bearing: a compromised delegator cannot
     // keep using stale subject tokens for revoked end-users.
     expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow(InvalidTokenError);
@@ -206,20 +206,20 @@ describe('exchangeSubjectToken — denial paths', () => {
   test('unsupported subject_token_type → invalid_request', async () => {
     const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: ['*'] });
     await provider.upsertSubject({
-      subjectId: 'saad@lid', sourceId: 'general', allowedSources: ['general'],
+      subjectId: 'alice-example@lid', sourceId: 'general', allowedSources: ['general'],
     });
     expect(provider.exchangeSubjectToken(
-      clientId, clientSecret, 'saad@lid', 'urn:ietf:params:oauth:token-type:jwt',
+      clientId, clientSecret, 'alice-example@lid', 'urn:ietf:params:oauth:token-type:jwt',
     )).rejects.toThrow(/unsupported subject_token_type/);
   });
 
   test('wrong client secret → invalid_client', async () => {
     const { clientId } = await registerDelegator({ allowedSubjects: ['*'] });
     await provider.upsertSubject({
-      subjectId: 'saad@lid', sourceId: 'general', allowedSources: ['general'],
+      subjectId: 'alice-example@lid', sourceId: 'general', allowedSources: ['general'],
     });
     expect(provider.exchangeSubjectToken(
-      clientId, 'gbrain_cs_wrong', 'saad@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
+      clientId, 'gbrain_cs_wrong', 'alice-example@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
     )).rejects.toThrow(/Invalid client/);
   });
 });
@@ -245,16 +245,16 @@ describe('regression: non-exchange grants still use the client\'s source / feder
 
 describe('allowClientExchange', () => {
   test('passing --revoke equivalent (empty array) sets token_exchange_allowed=FALSE', async () => {
-    const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: ['saad@lid'] });
+    const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: ['alice-example@lid'] });
     await provider.upsertSubject({
-      subjectId: 'saad@lid', sourceId: 'general', allowedSources: ['general'],
+      subjectId: 'alice-example@lid', sourceId: 'general', allowedSources: ['general'],
     });
     // Works once.
-    await provider.exchangeSubjectToken(clientId, clientSecret, 'saad@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID);
+    await provider.exchangeSubjectToken(clientId, clientSecret, 'alice-example@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID);
     // Now revoke; future calls fail.
     await provider.allowClientExchange(clientId, []);
     expect(provider.exchangeSubjectToken(
-      clientId, clientSecret, 'saad@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
+      clientId, clientSecret, 'alice-example@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
     )).rejects.toThrow(/not authorized for token exchange/);
   });
 });
@@ -330,25 +330,25 @@ describe('scope echo (RFC 8693 §2.2.1)', () => {
   test('response includes a `scope` field always, populated with the EFFECTIVE granted scopes', async () => {
     const { clientId, clientSecret } = await registerDelegator({
       scopes: 'read write',
-      allowedSubjects: ['saad@lid'],
+      allowedSubjects: ['alice-example@lid'],
     });
-    await provider.upsertSubject({ subjectId: 'saad@lid', sourceId: 'general', allowedSources: ['general'] });
+    await provider.upsertSubject({ subjectId: 'alice-example@lid', sourceId: 'general', allowedSources: ['general'] });
 
     // requested = ['read'] → granted = ['read'] (subset of grant)
     const r1 = await provider.exchangeSubjectToken(
-      clientId, clientSecret, 'saad@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID, 'read',
+      clientId, clientSecret, 'alice-example@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID, 'read',
     );
     expect(r1.scope).toBe('read');
 
     // requested omitted → granted defaults to full client grant
     const r2 = await provider.exchangeSubjectToken(
-      clientId, clientSecret, 'saad@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
+      clientId, clientSecret, 'alice-example@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
     );
     expect(r2.scope?.split(' ').sort()).toEqual(['read', 'write']);
 
     // requested superset → clamped DOWN; response echoes the narrower set
     const r3 = await provider.exchangeSubjectToken(
-      clientId, clientSecret, 'saad@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID, 'read write admin',
+      clientId, clientSecret, 'alice-example@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID, 'read write admin',
     );
     expect(r3.scope?.split(' ').sort()).toEqual(['read', 'write']);   // admin dropped
   });
@@ -356,11 +356,11 @@ describe('scope echo (RFC 8693 §2.2.1)', () => {
 
 describe('RFC 8707 resource binding', () => {
   test('exchange honors `resource` parameter and persists it on the token row', async () => {
-    const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: ['saad@lid'] });
-    await provider.upsertSubject({ subjectId: 'saad@lid', sourceId: 'general', allowedSources: ['general'] });
-    const resource = new URL('https://hermes.example.com/mcp');
+    const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: ['alice-example@lid'] });
+    await provider.upsertSubject({ subjectId: 'alice-example@lid', sourceId: 'general', allowedSources: ['general'] });
+    const resource = new URL('https://acme-example.com/mcp');
     const tokens = await provider.exchangeSubjectToken(
-      clientId, clientSecret, 'saad@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID, undefined, resource,
+      clientId, clientSecret, 'alice-example@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID, undefined, resource,
     );
     const auth = await provider.verifyAccessToken(tokens.access_token);
     // verifyAccessToken returns a URL when oauth_tokens.resource is set;
@@ -370,10 +370,10 @@ describe('RFC 8707 resource binding', () => {
   });
 
   test('exchange without resource leaves the token unbound (back-compat)', async () => {
-    const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: ['saad@lid'] });
-    await provider.upsertSubject({ subjectId: 'saad@lid', sourceId: 'general', allowedSources: ['general'] });
+    const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: ['alice-example@lid'] });
+    await provider.upsertSubject({ subjectId: 'alice-example@lid', sourceId: 'general', allowedSources: ['general'] });
     const tokens = await provider.exchangeSubjectToken(
-      clientId, clientSecret, 'saad@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
+      clientId, clientSecret, 'alice-example@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
     );
     const auth = await provider.verifyAccessToken(tokens.access_token);
     expect(auth.resource).toBeUndefined();
@@ -382,13 +382,13 @@ describe('RFC 8707 resource binding', () => {
 
 describe('typed OAuth errors carry safe-for-wire descriptions', () => {
   test('rejects with code+description; logDetail carries HASHED subject (no plaintext lid in logs)', async () => {
-    const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: ['only-saad@lid'] });
+    const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: ['only-alice-example@lid'] });
     await provider.upsertSubject({
-      subjectId: 'shahzaib@lid', sourceId: 'general', allowedSources: ['general'],
+      subjectId: 'charlie-example@lid', sourceId: 'general', allowedSources: ['general'],
     });
     try {
       await provider.exchangeSubjectToken(
-        clientId, clientSecret, 'shahzaib@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
+        clientId, clientSecret, 'charlie-example@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
       );
       throw new Error('expected throw');
     } catch (e) {
@@ -399,22 +399,22 @@ describe('typed OAuth errors carry safe-for-wire descriptions', () => {
       expect(oerr.code).toBe('invalid_grant');
       // The wire-safe description is a FIXED string with no input echo.
       expect(oerr.message).toBe('subject not allowed for this client');
-      expect(oerr.message).not.toContain('shahzaib');
+      expect(oerr.message).not.toContain('charlie-example');
       // GDPR / EDPB Guidelines 01/2025: the WhatsApp lid is an "online
       // identifier" — load-bearing: logDetail must carry the SHA-256
       // PREFIX, NOT the raw lid, so the deny-path audit log doesn't leak
       // PII into journald via OAuthGrantError.logDetail.
-      expect(oerr.logDetail).not.toContain('shahzaib');
+      expect(oerr.logDetail).not.toContain('charlie-example');
       expect(oerr.logDetail).toMatch(/subject_id_hash=[0-9a-f]{16}/);
     }
   });
 
   test('unsupported subject_token_type echoes the URI (structural metadata, not PII)', async () => {
     const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: ['*'] });
-    await provider.upsertSubject({ subjectId: 'saad@lid', sourceId: 'general', allowedSources: ['general'] });
+    await provider.upsertSubject({ subjectId: 'alice-example@lid', sourceId: 'general', allowedSources: ['general'] });
     try {
       await provider.exchangeSubjectToken(
-        clientId, clientSecret, 'saad@lid',
+        clientId, clientSecret, 'alice-example@lid',
         'urn:ietf:params:oauth:token-type:jwt',  // not supported
       );
       throw new Error('expected throw');
@@ -459,16 +459,16 @@ describe('race: deleteSubject mid-exchange does not produce a working token', ()
   test('subject deleted between mint and verify → InvalidTokenError', async () => {
     const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: ['*'] });
     await provider.upsertSubject({
-      subjectId: 'saad@lid', sourceId: 'general', allowedSources: ['general'],
+      subjectId: 'alice-example@lid', sourceId: 'general', allowedSources: ['general'],
     });
     // Two operations that race in production: the gateway exchanges a
-    // token for saad; an operator concurrently revokes saad. We simulate
+    // token for alice-example; an operator concurrently revokes alice-example. We simulate
     // by running deleteSubject AFTER exchange completes but BEFORE the
     // gateway uses the token — the same wall-clock outcome as a real race.
     const tokens = await provider.exchangeSubjectToken(
-      clientId, clientSecret, 'saad@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
+      clientId, clientSecret, 'alice-example@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID,
     );
-    await provider.deleteSubject('saad@lid');
+    await provider.deleteSubject('alice-example@lid');
     // verifyAccessToken JOINs subjects with deleted_at IS NULL → 0 rows
     // → throws InvalidTokenError. Load-bearing: this is the only barrier
     // between a compromised delegator and an indefinitely-replayable
@@ -480,15 +480,15 @@ describe('race: deleteSubject mid-exchange does not produce a working token', ()
   test('concurrent exchange + deleteSubject — even when delete races BEFORE the exchange completes, the token must not be usable', async () => {
     const { clientId, clientSecret } = await registerDelegator({ allowedSubjects: ['*'] });
     await provider.upsertSubject({
-      subjectId: 'saad@lid', sourceId: 'general', allowedSources: ['general'],
+      subjectId: 'alice-example@lid', sourceId: 'general', allowedSources: ['general'],
     });
     // Fire both at once. We don't assert which wins (it's a true race)
     // but we DO assert that any token we successfully obtained still
     // fails verify after the delete settles. Belt-and-suspenders for
     // the "delegator can use stale subject tokens" hazard.
     const [exchangeResult, _del] = await Promise.allSettled([
-      provider.exchangeSubjectToken(clientId, clientSecret, 'saad@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID),
-      provider.deleteSubject('saad@lid'),
+      provider.exchangeSubjectToken(clientId, clientSecret, 'alice-example@lid', SUBJECT_TOKEN_TYPE_SUBJECT_ID),
+      provider.deleteSubject('alice-example@lid'),
     ]);
     if (exchangeResult.status === 'fulfilled') {
       await expect(provider.verifyAccessToken(exchangeResult.value.access_token)).rejects.toThrow();

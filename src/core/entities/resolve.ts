@@ -22,6 +22,10 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+// STAGE 2 (2026-07-06): cross-source page reads route via the admin pool
+// so autopilot survives STAGE 4's drop of the runtime role default.
+// Behavioral no-op until GBRAIN_ADMIN_DATABASE_URL is wired.
+import { maintenanceRaw } from '../maintenance-query.ts';
 
 /**
  * Canonicalize a free-form entity reference to a page slug.
@@ -213,10 +217,11 @@ export async function findPrefixCandidates(
     patterns.push(`${dir}/${token}-%`);
   }
   try {
-    const rows = await engine.executeRaw<{
+    const rows = await maintenanceRaw<{
       slug: string;
       connection_count: number;
     }>(
+      engine,
       `SELECT p.slug,
               ((SELECT COUNT(*)::int FROM links WHERE to_page_id = p.id)
                + (SELECT COUNT(*)::int FROM links WHERE from_page_id = p.id)
@@ -256,10 +261,11 @@ async function tryPrefixExpansion(
   for (const dir of PREFIX_EXPANSION_DIRS) {
     const pattern = `${dir}/${token}-%`;
     try {
-      const rows = await engine.executeRaw<{
+      const rows = await maintenanceRaw<{
         slug: string;
         connection_count: number;
       }>(
+        engine,
         // Connection count is a simple proxy for canonicality:
         // (incoming links) + (outgoing links) + (content chunks).
         //
@@ -320,7 +326,8 @@ async function tryExactSlug(
   candidate: string,
 ): Promise<string | null> {
   try {
-    const rows = await engine.executeRaw<{ slug: string }>(
+    const rows = await maintenanceRaw<{ slug: string }>(
+      engine,
       `SELECT slug FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL LIMIT 1`,
       [source_id, candidate],
     );
@@ -342,7 +349,8 @@ async function tryFuzzyMatch(
   // tends to be display-name-shaped ("Alice Example" vs "alice-example"). Cap at
   // 3 candidates; pick the first deterministic one.
   try {
-    const rows = await engine.executeRaw<{ slug: string; title: string; score: number }>(
+    const rows = await maintenanceRaw<{ slug: string; title: string; score: number }>(
+      engine,
       `SELECT slug, title,
          GREATEST(
            similarity(lower(title), $2),

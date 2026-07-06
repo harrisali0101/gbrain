@@ -51,6 +51,11 @@ import type { ProgressReporter } from '../progress.ts';
 import { chat as gatewayChat } from '../ai/gateway.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
+// STAGE 2 (2026-07-06): cross-source page reads route via the admin pool
+// so autopilot survives STAGE 4's drop of the runtime role default.
+// Behavioral no-op until GBRAIN_ADMIN_DATABASE_URL is wired — see
+// hermes-personal-agent/azure/design/hermes-postgres-role-split.md.
+import { maintenanceRaw } from '../maintenance-query.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
 
@@ -202,11 +207,11 @@ export async function discoverExtractablePages(
   if (hasFilter) params.push(affectedSlugs);
 
   try {
-    const rows = await engine.executeRaw<{
+    const rows = await maintenanceRaw<{
       slug: string;
       compiled_truth: string;
       content_hash: string;
-    }>(sql, params);
+    }>(engine, sql, params);
     return rows.map((r) => ({
       slug: r.slug,
       content: r.compiled_truth,
@@ -275,7 +280,7 @@ export async function countExtractAtomsBacklog(
     const params = scoped
       ? [sourceId, EXTRACTABLE_PAGE_TYPES as unknown as string[], MIN_PAGE_CHARS_FOR_EXTRACTION]
       : [EXTRACTABLE_PAGE_TYPES as unknown as string[], MIN_PAGE_CHARS_FOR_EXTRACTION];
-    const rows = await engine.executeRaw<{ cnt: string | number }>(sql, params);
+    const rows = await maintenanceRaw<{ cnt: string | number }>(engine, sql, params);
     return Number(rows[0]?.cnt ?? 0);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -307,7 +312,8 @@ export async function atomsExistingForHashes(
 ): Promise<Set<string>> {
   if (contentHash16s.length === 0) return new Set();
   try {
-    const rows = await engine.executeRaw<{ h: string }>(
+    const rows = await maintenanceRaw<{ h: string }>(
+      engine,
       `SELECT frontmatter->>'source_hash' AS h
          FROM pages
         WHERE type = 'atom'

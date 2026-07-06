@@ -94,6 +94,35 @@ export function getPostgresSchema(
 export class PostgresEngine implements BrainEngine {
   readonly kind = 'postgres' as const;
   private _sql: ReturnType<typeof postgres> | null = null;
+  /**
+   * STAGE 1 of the hermesadmin/hermesruntime role split. See
+   * `hermes-personal-agent/azure/design/hermes-postgres-role-split.md`
+   * (Option A — two-pool full split).
+   *
+   * Second Postgres pool used ONLY by `withMaintenanceTransaction` for
+   * cross-source autopilot / maintenance work that must see rows across
+   * every source (extract-atoms, patterns, synthesize-concepts,
+   * calibration, backfill-effective-date, retrieval-reflex,
+   * phantom-redirect, etc. — ~20 raw `FROM pages` sites outside
+   * `postgres-engine.ts`).
+   *
+   * Populated LAZILY by `_ensureAdminPool()` on first
+   * `withMaintenanceTransaction` call:
+   *   - if `GBRAIN_ADMIN_DATABASE_URL` is set, a new `postgres()` pool
+   *     is created against it (expected to be the `hermesadmin` role
+   *     URL — SUPERUSER + BYPASSRLS);
+   *   - if unset, the helper aliases to the runtime pool (`this.sql`).
+   *     Under today's posture (`hermesruntime` still holds BYPASSRLS
+   *     as a temporary carry-over — see `azure/scripts/fetch-secrets.sh:69-72`)
+   *     that fallback is behaviorally identical to a dedicated admin
+   *     pool.
+   *
+   * NOT eagerly initialised at `connect()` time by design: environments
+   * that have not yet provisioned `hermesadmin` (or the KV secret) must
+   * still be able to boot the engine, and the fallback path keeps
+   * autopilot code working while STAGE 2 of the rollout is in flight.
+   */
+  private _sqlAdmin: ReturnType<typeof postgres> | null = null;
   /** Saved config for reconnection. */
   private _savedConfig: (EngineConfig & { poolSize?: number; parentConnectionManager?: ConnectionManager }) | null = null;
   /** Whether a reconnect is in progress (prevents concurrent reconnects). */
@@ -222,6 +251,185 @@ export class PostgresEngine implements BrainEngine {
     })) as T;
   }
 
+  // ---------------------------------------------------------------------------
+  // STAGE 1 — hermesadmin / hermesruntime role split
+  //
+  // Design memo:
+  //   hermes-personal-agent/azure/design/hermes-postgres-role-split.md
+  //
+  // Companion SQL migration:
+  //   hermes-personal-agent/azure/sql/migrations/2026-07-05-add-hermesadmin-role.sql
+  //
+  // Decision matrix — when to use `withMaintenanceTransaction` vs
+  // `withScopedReadTransaction`:
+  //
+  //   +-------------------------------+---------------------------------+
+  //   | Query intent                  | Use                             |
+  //   +-------------------------------+---------------------------------+
+  //   | Serves an MCP `hermes_read:*` | withScopedReadTransaction       |
+  //   | tool or any user-facing read  | (RLS-enforced via `app.scopes`) |
+  //   +-------------------------------+---------------------------------+
+  //   | Cross-source autopilot,       | withMaintenanceTransaction      |
+  //   | cycle, calibration, backfill, | (BYPASSRLS via `hermesadmin`)   |
+  //   | reflex, entity resolution     |                                 |
+  //   +-------------------------------+---------------------------------+
+  //   | DDL / migrations              | Direct CLI as `hermesadmin`     |
+  //   | (`gbrain migrate`)            | via `--url` (unchanged)         |
+  //   +-------------------------------+---------------------------------+
+  //
+  // If you are unsure: default to `withScopedReadTransaction`. Missing
+  // rows are loud (0 rows returned) once STAGE 3 flips
+  // `hermesruntime NOBYPASSRLS`. Extraneous access to admin pool from
+  // a user-facing read path is a silent authorization bug and cannot
+  // be undone by later stages.
+  //
+  // STAGE 1 (this PR): helper exists; no callers migrated. Behaviorally
+  //                    identical to today because `_sqlAdmin` falls
+  //                    back to the runtime pool when
+  //                    `GBRAIN_ADMIN_DATABASE_URL` is unset AND the
+  //                    runtime pool still holds BYPASSRLS as a
+  //                    temporary carry-over.
+  // STAGE 2 (next):    migrate the ~20 raw `FROM pages` autopilot sites
+  //                    listed in the design memo to
+  //                    `engine.withMaintenanceTransaction(tx =>
+  //                    tx.unsafe(sql, params))`.
+  // STAGE 3 (later):   `ALTER ROLE hermesruntime NOBYPASSRLS`. RLS now
+  //                    bites. Any user-facing read that forgot the
+  //                    `withScopedReadTransaction` wrap returns 0 rows.
+  // STAGE 4 (last):    `ALTER ROLE hermesruntime RESET app.scopes`.
+  //                    Belt-and-braces removal of the role-default
+  //                    scope failsafe.
+  //
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Ensure a Postgres pool for the maintenance/admin role is available.
+   *
+   * Lazy: no pool is opened until the first `withMaintenanceTransaction`
+   * call. This preserves the invariant that a bare `PostgresEngine`
+   * boot never touches the admin role, which matters because
+   *   (a) the `hermesadmin` role may not exist yet on a freshly
+   *       provisioned Postgres (the STAGE 1 SQL migration bootstraps it);
+   *   (b) some deployments (upstream gbrain, local pglite fallback, CI)
+   *       have no admin URL at all and should keep working under the
+   *       runtime-pool alias.
+   *
+   * Behavior:
+   *   - If `GBRAIN_ADMIN_DATABASE_URL` is set (non-empty), a dedicated
+   *     `postgres()` pool is created against it, memoised on
+   *     `this._sqlAdmin`, and returned. Options mirror the runtime
+   *     pool created in `connect()` (idle_timeout, connect_timeout,
+   *     resolvePrepare, resolveSessionTimeouts, silent NOTICEs). Errors
+   *     bubble to the caller (e.g. `role "hermesadmin" does not exist`
+   *     if STAGE 1 has not been applied on this DB).
+   *   - If `GBRAIN_ADMIN_DATABASE_URL` is unset OR empty, the runtime
+   *     pool (`this.sql`) is returned WITHOUT memoising on `_sqlAdmin`
+   *     (so a later env-var flip during the same process still opens
+   *     a dedicated pool). Under today's posture the runtime pool has
+   *     BYPASSRLS, so autopilot reads see every row — same behavior
+   *     as with a dedicated admin pool.
+   */
+  private async _ensureAdminPool(): Promise<ReturnType<typeof postgres>> {
+    if (this._sqlAdmin) return this._sqlAdmin;
+
+    const adminUrl = process.env.GBRAIN_ADMIN_DATABASE_URL?.trim();
+    if (!adminUrl) {
+      // TODO(stage-2): once STAGE 2 wires `admin_database_url` into
+      // `~/.gbrain/config.json` (via `azure/scripts/fetch-secrets.sh`),
+      // an unset env var + no config field will still fall through to
+      // the runtime pool — but a MISSET env var (non-empty but wrong
+      // credentials) should fail loudly rather than silently aliasing.
+      // The current code already does that via the `postgres()` call
+      // below, which errors on first query. This TODO is a reminder to
+      // audit the fallback logic when the config-file path is added.
+      return this.sql;
+    }
+
+    const prepare = db.resolvePrepare(adminUrl);
+    const timeouts = db.resolveSessionTimeouts();
+    const opts: Record<string, unknown> = {
+      // Small pool — autopilot is sequential in practice (one worker,
+      // batched cross-source reads). If a caller needs more it can lift
+      // this via `GBRAIN_POOL_SIZE` (resolvePoolSize honors it).
+      max: db.resolvePoolSize(),
+      idle_timeout: 20,
+      connect_timeout: 10,
+      types: { bigint: postgres.BigInt },
+      onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
+    };
+    if (Object.keys(timeouts).length > 0) {
+      opts.connection = timeouts;
+    }
+    if (typeof prepare === 'boolean') {
+      opts.prepare = prepare;
+    }
+
+    // Note: no `SELECT 1` warm-up ping here (unlike `connect()`). A
+    // warm-up ping would surface a bad URL / missing role synchronously
+    // at helper-init time, but it would also make first-use of
+    // `withMaintenanceTransaction` pay an extra round trip. Errors
+    // still bubble on the first real query inside `.begin()` below.
+    this._sqlAdmin = postgres(adminUrl, opts);
+    return this._sqlAdmin;
+  }
+
+  /**
+   * Run `callback` inside a Postgres transaction on the admin
+   * (maintenance) pool. Mirrors `withScopedReadTransaction`'s shape:
+   *   - always opens a transaction (so nested `SET LOCAL` in the
+   *     callback is safely scoped);
+   *   - does NOT emit `SET LOCAL app.scopes` (the admin pool is
+   *     BYPASSRLS by contract — the RLS policy does not gate it);
+   *   - returns the callback's result unwrapped, matching
+   *     `withScopedReadTransaction`'s return typing.
+   *
+   * Intended callers (STAGE 2): the ~20 raw `FROM pages` sites in
+   * `cycle/*`, `entities/resolve.ts`, `retrieval-reflex.ts`,
+   * `backfill-effective-date.ts`, etc. See the design memo for the
+   * full inventory. Each site becomes:
+   *
+   * ```ts
+   * // TODO(stage-2): STAGE 1 landed the helper; STAGE 2 migrates the
+   * // call sites listed in the design memo table.
+   * const rows = await engine.withMaintenanceTransaction(tx =>
+   *   tx.unsafe(sql, params) as unknown as Promise<Array<Row>>,
+   * );
+   * ```
+   *
+   * The `public` visibility is intentional — the helper is the
+   * cross-source escape hatch autopilot code will reach for, so it
+   * must be reachable from anywhere `PostgresEngine` is (analogous to
+   * `executeRaw`). `operations.ts` MUST NOT call this method: every
+   * MCP tool must go through `withScopedReadTransaction` so RLS is
+   * the gate. Code review + a future lint gate on `operations.ts`
+   * enforces this (design memo, "Gotchas" §6).
+   *
+   * @typeParam T - The callback's return type.
+   * @param callback - Receives the postgres.js transaction handle.
+   *   Runs inside `BEGIN … COMMIT` on the admin pool.
+   * @returns The callback's return value, unwrapped.
+   * @throws Whatever `postgres()` throws — including
+   *   `role "hermesadmin" does not exist` if the STAGE 1 SQL migration
+   *   has not been applied on the target DB and
+   *   `GBRAIN_ADMIN_DATABASE_URL` names that role.
+   */
+  async withMaintenanceTransaction<T>(
+    callback: (tx: ReturnType<typeof postgres>) => Promise<T>,
+  ): Promise<T> {
+    const pool = await this._ensureAdminPool();
+    // Same `UnwrapPromiseArray<T>` → `T` cast as
+    // `withScopedReadTransaction`; safe when the callback returns a
+    // single value rather than an array of promises. See the comment
+    // at the top of that method for the postgres.js typing detail.
+    return (await pool.begin(async (tx: any) => {
+      // Deliberately no `SET LOCAL app.scopes` here — the admin pool is
+      // BYPASSRLS by contract. If a future stage carves SUPERUSER off
+      // hermesadmin (design memo open question #3), the role's
+      // BYPASSRLS bit is what keeps this transaction unrestricted.
+      return await callback(tx as ReturnType<typeof postgres>);
+    })) as T;
+  }
+
   // Lifecycle
   async connect(config: EngineConfig & { poolSize?: number; parentConnectionManager?: ConnectionManager }): Promise<void> {
     this._savedConfig = config;
@@ -312,6 +520,14 @@ export class PostgresEngine implements BrainEngine {
     if (this.connectionManager) {
       await this.connectionManager.disconnect();
       this.connectionManager = null;
+    }
+    // STAGE 1 (role split): tear down the lazily-created admin pool if
+    // any `withMaintenanceTransaction` call opened one during this
+    // engine's lifetime. Bounded end mirrors the runtime-pool teardown
+    // below so a hung PgBouncer drain can't block disconnect().
+    if (this._sqlAdmin) {
+      await db.endPoolBounded(this._sqlAdmin);
+      this._sqlAdmin = null;
     }
     if (this._sql) {
       // #1972: gbrain-owned hard bound so a PgBouncer drain that never settles

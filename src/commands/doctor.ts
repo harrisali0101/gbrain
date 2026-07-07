@@ -493,8 +493,11 @@ export async function runtimeRoleNoBypassRlsCheck(engine: BrainEngine): Promise<
     };
   }
   try {
+    // pg_roles is the public view over pg_authid (minus rolpassword),
+    // readable by any role. pg_authid requires SUPERUSER (which
+    // hermesruntime does not have — that's the whole point of STAGE 2).
     const rows = await engine.executeRaw<{ rolbypassrls: boolean }>(
-      `SELECT rolbypassrls FROM pg_authid WHERE rolname = 'hermesruntime'`,
+      `SELECT rolbypassrls FROM pg_roles WHERE rolname = 'hermesruntime'`,
     );
     if (rows.length === 0) {
       return {
@@ -520,7 +523,7 @@ export async function runtimeRoleNoBypassRlsCheck(engine: BrainEngine): Promise<
     return {
       name: 'runtime_role_no_bypass_rls',
       status: 'warn',
-      message: `Could not query pg_authid for hermesruntime.rolbypassrls: ${msg}`,
+      message: `Could not query pg_roles for hermesruntime.rolbypassrls: ${msg}`,
     };
   }
 }

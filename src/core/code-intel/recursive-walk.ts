@@ -16,6 +16,8 @@
  */
 import type { BrainEngine } from '../engine.ts';
 import type { CodeEdgeResult } from '../types.ts';
+// STAGE 2 batch D (2026-07-07): cross-source reads via admin pool.
+import { maintenanceRaw } from '../maintenance-query.ts';
 import { classifySink, type SinkKind } from './sinks/index.ts';
 
 export type WalkDirection = 'callers' | 'callees';
@@ -81,7 +83,8 @@ async function disambiguateSymbol(
 ): Promise<{ matches: string[]; suggestions: { symbol_qualified: string; score: number }[] }> {
   try {
     // Exact-match candidates first: anything with symbol_name = bare
-    const exact = await engine.executeRaw<{ symbol_name_qualified: string }>(
+    const exact = await maintenanceRaw<{ symbol_name_qualified: string }>(
+      engine,
       `SELECT DISTINCT symbol_name_qualified
          FROM content_chunks
          JOIN pages ON pages.id = content_chunks.page_id
@@ -96,7 +99,8 @@ async function disambiguateSymbol(
 
     // No exact match — try trigram similarity for did_you_mean. Many
     // engines don't have pg_trgm by default; fall back to LIKE-prefix.
-    const fuzzy = await engine.executeRaw<{ symbol_name_qualified: string }>(
+    const fuzzy = await maintenanceRaw<{ symbol_name_qualified: string }>(
+      engine,
       `SELECT DISTINCT symbol_name_qualified
          FROM content_chunks
          JOIN pages ON pages.id = content_chunks.page_id
@@ -128,7 +132,8 @@ async function detectSymbolLanguage(
   sourceId: string,
 ): Promise<string | null> {
   try {
-    const rows = await engine.executeRaw<{ language: string | null }>(
+    const rows = await maintenanceRaw<{ language: string | null }>(
+      engine,
       `SELECT content_chunks.language
          FROM content_chunks
          JOIN pages ON pages.id = content_chunks.page_id

@@ -42,6 +42,8 @@
 import { execFileSync } from 'node:child_process';
 import { GSTACK_LEARNING_NAMESPACE } from './gstack-coupling.ts';
 import type { BrainEngine } from '../engine.ts';
+// STAGE 2 batch C (2026-07-07): cross-source reads via admin pool.
+import { maintenanceRaw } from '../maintenance-query.ts';
 
 export interface UndoWaveOpts {
   /** Wave version to reverse. v0.36.1.0 ship state: 'v0.36.1.0'. */
@@ -101,7 +103,8 @@ export async function undoWave(
   // wave_version match. Cross-check resolved_by to ensure we're not
   // un-resolving a take a manual `gbrain takes resolve` operation
   // overrode after grade_takes wrote it.
-  const targetTakeRows = await engine.executeRaw<{ take_id: number }>(
+  const targetTakeRows = await maintenanceRaw<{ take_id: number }>(
+    engine,
     `SELECT DISTINCT take_id FROM take_grade_cache
      WHERE wave_version = $1 AND applied = true`,
     [waveVersion],
@@ -110,7 +113,8 @@ export async function undoWave(
 
   if (targetTakeIds.length > 0) {
     if (dryRun) {
-      const counted = await engine.executeRaw<{ count: number }>(
+      const counted = await maintenanceRaw<{ count: number }>(
+        engine,
         `SELECT COUNT(*)::int AS count FROM takes
          WHERE id = ANY($1::bigint[])
            AND resolved_by = $2`,
@@ -118,7 +122,8 @@ export async function undoWave(
       );
       result.resolutions_reverted = counted[0]?.count ?? 0;
     } else {
-      const reverted = await engine.executeRaw<{ id: number }>(
+      const reverted = await maintenanceRaw<{ id: number }>(
+        engine,
         `UPDATE takes
            SET resolved_at = NULL,
                resolved_outcome = NULL,
@@ -141,7 +146,8 @@ export async function undoWave(
   // confidence-drift check (CDX-11 mitigation) so the historical
   // applied=true rows aren't counted in confidence-vs-accuracy.
   if (!dryRun) {
-    const cacheUnset = await engine.executeRaw<{ take_id: number }>(
+    const cacheUnset = await maintenanceRaw<{ take_id: number }>(
+      engine,
       `UPDATE take_grade_cache
          SET applied = false
        WHERE wave_version = $1 AND applied = true
@@ -150,7 +156,8 @@ export async function undoWave(
     );
     result.grade_cache_unapplied = cacheUnset.length;
   } else {
-    const cacheCount = await engine.executeRaw<{ count: number }>(
+    const cacheCount = await maintenanceRaw<{ count: number }>(
+      engine,
       `SELECT COUNT(*)::int AS count FROM take_grade_cache
        WHERE wave_version = $1 AND applied = true`,
       [waveVersion],
@@ -160,13 +167,15 @@ export async function undoWave(
 
   // Step 2: delete calibration_profiles rows.
   if (dryRun) {
-    const counted = await engine.executeRaw<{ count: number }>(
+    const counted = await maintenanceRaw<{ count: number }>(
+      engine,
       `SELECT COUNT(*)::int AS count FROM calibration_profiles WHERE wave_version = $1`,
       [waveVersion],
     );
     result.profiles_deleted = counted[0]?.count ?? 0;
   } else {
-    const deleted = await engine.executeRaw<{ id: number }>(
+    const deleted = await maintenanceRaw<{ id: number }>(
+      engine,
       `DELETE FROM calibration_profiles WHERE wave_version = $1 RETURNING id`,
       [waveVersion],
     );
@@ -175,13 +184,15 @@ export async function undoWave(
 
   // Step 3: purge take_nudge_log rows.
   if (dryRun) {
-    const counted = await engine.executeRaw<{ count: number }>(
+    const counted = await maintenanceRaw<{ count: number }>(
+      engine,
       `SELECT COUNT(*)::int AS count FROM take_nudge_log WHERE wave_version = $1`,
       [waveVersion],
     );
     result.nudges_purged = counted[0]?.count ?? 0;
   } else {
-    const purged = await engine.executeRaw<{ id: number }>(
+    const purged = await maintenanceRaw<{ id: number }>(
+      engine,
       `DELETE FROM take_nudge_log WHERE wave_version = $1 RETURNING id`,
       [waveVersion],
     );

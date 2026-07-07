@@ -22,6 +22,8 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+// STAGE 2 batch C (2026-07-07): cross-source reads via admin pool.
+import { maintenanceRaw } from '../maintenance-query.ts';
 
 export interface ABRunInput {
   question: string;
@@ -65,7 +67,8 @@ export async function runAbTrial(input: ABRunInput): Promise<ABRunResult> {
     baseline: baseline.answer,
     withCalibration: withCal.answer,
   });
-  const rows = await input.engine.executeRaw<{ id: number }>(
+  const rows = await maintenanceRaw<{ id: number }>(
+    input.engine,
     `INSERT INTO think_ab_results
        (source_id, question, baseline_answer, with_calibration_answer, preferred, model_id, notes)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -112,7 +115,8 @@ export async function buildAbReport(
   opts: { days?: number } = {},
 ): Promise<AbReportResult> {
   const days = opts.days ?? 30;
-  const rows = await engine.executeRaw<{ preferred: string; count: number }>(
+  const rows = await maintenanceRaw<{ preferred: string; count: number }>(
+    engine,
     `SELECT preferred, COUNT(*)::int AS count
        FROM think_ab_results
        WHERE ran_at >= now() - INTERVAL '${days} days'

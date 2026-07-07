@@ -40,6 +40,8 @@
 import type { BrainEngine } from '../engine.ts';
 import type { DomainBankRow } from '../types.ts';
 import { INJECTION_PATTERNS } from '../think/sanitize.ts';
+// STAGE 2 batch C (2026-07-07): cross-source reads via admin pool.
+import { maintenanceRaw } from '../maintenance-query.ts';
 
 /** Default 1-hour TTL for the prefix-enumeration cache (D3). */
 export const PREFIX_CACHE_TTL_MS = 60 * 60 * 1000;
@@ -210,7 +212,8 @@ export async function enumeratePrefixes(
 ): Promise<string[]> {
   const sourceIds = opts.sourceIds ?? null;
   const sourceId = opts.sourceId ?? null;
-  const rows = await engine.executeRaw<{ prefix: string | null }>(
+  const rows = await maintenanceRaw<{ prefix: string | null }>(
+    engine,
     `SELECT DISTINCT substring(slug from '^[^/]+/[^/]+') AS prefix
        FROM pages
        WHERE deleted_at IS NULL

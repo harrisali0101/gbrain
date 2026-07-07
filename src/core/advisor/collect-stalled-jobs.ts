@@ -8,6 +8,8 @@
  */
 
 import type { AdvisorCollector, AdvisorFinding } from './types.ts';
+// STAGE 2 batch D (2026-07-07): cross-source reads via admin pool.
+import { maintenanceRaw } from '../maintenance-query.ts';
 
 export const collectStalledJobs: AdvisorCollector = {
   id: 'stalled-jobs',
@@ -16,7 +18,8 @@ export const collectStalledJobs: AdvisorCollector = {
 
     // Stuck active jobs: lock lapsed or stalled-counter climbing.
     try {
-      const rows = await ctx.engine.executeRaw<{ name: string; n: number }>(
+      const rows = await maintenanceRaw<{ name: string; n: number }>(
+        ctx.engine,
         `SELECT name, count(*)::int AS n
            FROM minion_jobs
           WHERE status = 'active'
@@ -41,7 +44,8 @@ export const collectStalledJobs: AdvisorCollector = {
 
     // Stale federated sources: synced sources that haven't advanced in a week.
     try {
-      const rows = await ctx.engine.executeRaw<{ id: string }>(
+      const rows = await maintenanceRaw<{ id: string }>(
+        ctx.engine,
         `SELECT id
            FROM sources
           WHERE last_sync_at IS NOT NULL

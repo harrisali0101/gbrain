@@ -19,6 +19,8 @@
  */
 
 import type { BrainEngine } from './../engine.ts';
+// STAGE 2 batch D (2026-07-07): cross-source reads via admin pool.
+import { maintenanceRaw } from '../maintenance-query.ts';
 import { registerBackgroundWorkDrainer } from '../background-work.ts';
 
 export const VOLUNTEER_EVENTS_TTL_DAYS = 90;
@@ -85,7 +87,8 @@ export async function insertVolunteerEvents(
     const ph = Array.from({ length: 8 }, (_, i) => `$${base + i + 1}`);
     return `(${ph.join(', ')})`;
   });
-  await engine.executeRaw(
+  await maintenanceRaw(
+    engine,
     `INSERT INTO context_volunteer_events
        (source_id, slug, confidence, match_arm, rationale, channel, session_id, turn)
      VALUES ${tuples.join(', ')}`,
@@ -170,7 +173,8 @@ export async function purgeStaleVolunteerEvents(
   ttlDays = VOLUNTEER_EVENTS_TTL_DAYS,
 ): Promise<number> {
   try {
-    const rows = await engine.executeRaw<{ count: string | number }>(
+    const rows = await maintenanceRaw<{ count: string | number }>(
+      engine,
       `WITH deleted AS (
          DELETE FROM context_volunteer_events
          WHERE volunteered_at < now() - ($1 || ' days')::interval

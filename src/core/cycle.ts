@@ -47,6 +47,8 @@ import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, statSyn
 import { join } from 'path';
 import { gbrainPath } from './config.ts';
 import type { BrainEngine } from './engine.ts';
+// STAGE 2 batch E (2026-07-07): cross-source reads via admin pool.
+import { maintenanceRaw } from './maintenance-query.ts';
 import { createProgress, type ProgressReporter } from './progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from './cli-options.ts';
 import { tryAcquireDbLock, reapDeadHolderLocks, type DbLockHandle } from './db-lock.ts';
@@ -833,7 +835,8 @@ async function resolveSourceForDir(
   // (the cycleSourceId precedence) or 'default'.
   if (brainDir === null) return undefined;
   try {
-    const rows = await engine.executeRaw<{ id: string }>(
+    const rows = await maintenanceRaw<{ id: string }>(
+      engine,
       `SELECT id FROM sources WHERE local_path = $1 LIMIT 1`,
       [brainDir],
     );

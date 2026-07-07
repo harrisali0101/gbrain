@@ -28,6 +28,8 @@
 import type { BrainEngine, Take } from '../engine.ts';
 import type { CalibrationProfileRow } from '../../commands/calibration.ts';
 import { nudgeTemplate } from './templates.ts';
+// STAGE 2 batch C (2026-07-07): cross-source reads via admin pool.
+import { maintenanceRaw } from '../maintenance-query.ts';
 
 export const NUDGE_COOLDOWN_DAYS = 14;
 export const NUDGE_CONVICTION_THRESHOLD = 0.7;
@@ -95,7 +97,8 @@ export async function checkCooldown(
   nudgePattern: string,
 ): Promise<boolean> {
   const cutoffDate = new Date(Date.now() - NUDGE_COOLDOWN_DAYS * 24 * 60 * 60 * 1000);
-  const rows = await engine.executeRaw<{ id: number }>(
+  const rows = await maintenanceRaw<{ id: number }>(
+    engine,
     `SELECT id FROM take_nudge_log
      WHERE take_id = $1 AND nudge_pattern = $2 AND fired_at >= $3
      LIMIT 1`,
@@ -111,7 +114,8 @@ export async function recordNudgeFire(
   engine: BrainEngine,
   opts: { sourceId: string; takeId: number; nudgePattern: string; channel?: string },
 ): Promise<void> {
-  await engine.executeRaw(
+  await maintenanceRaw(
+    engine,
     `INSERT INTO take_nudge_log (source_id, take_id, nudge_pattern, channel)
      VALUES ($1, $2, $3, $4)`,
     [opts.sourceId, opts.takeId, opts.nudgePattern, opts.channel ?? 'stderr'],
@@ -199,7 +203,8 @@ export async function resetNudgeCooldown(
   engine: BrainEngine,
   takeId: number,
 ): Promise<{ deleted: number }> {
-  const rows = await engine.executeRaw<{ id: number }>(
+  const rows = await maintenanceRaw<{ id: number }>(
+    engine,
     `DELETE FROM take_nudge_log WHERE take_id = $1 RETURNING id`,
     [takeId],
   );

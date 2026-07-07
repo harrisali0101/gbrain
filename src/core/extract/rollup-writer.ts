@@ -28,6 +28,8 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+// STAGE 2 batch D (2026-07-07): cross-source reads via admin pool.
+import { maintenanceRaw } from '../maintenance-query.ts';
 
 /**
  * One UPSERT increments per audit event. All counters default to 0 so
@@ -80,7 +82,7 @@ export async function upsertExtractRollup(
   const failures = input.failure_delta ?? 0;
 
   try {
-    await engine.executeRaw(
+    await maintenanceRaw(engine,
       `INSERT INTO extract_rollup_7d (
          kind, source_id, day,
          cost_usd, halt_count, eval_fail_count, eval_pass_count,

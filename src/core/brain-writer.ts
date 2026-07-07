@@ -28,6 +28,8 @@ import {
   type ParseValidationError,
 } from './markdown.ts';
 import { isSyncable, pruneDir, slugifyPath } from './sync.ts';
+// STAGE 2 batch D (2026-07-07): cross-source reads via admin pool.
+import { maintenanceRaw } from './maintenance-query.ts';
 
 export type { ParseValidationCode };
 
@@ -716,13 +718,15 @@ export function walkDir(
 
 async function listSources(engine: BrainEngine, sourceId?: string): Promise<SourceRow[]> {
   if (sourceId) {
-    const rows = await engine.executeRaw<SourceRow>(
+    const rows = await maintenanceRaw<SourceRow>(
+      engine,
       `SELECT id, local_path FROM sources WHERE id = $1`,
       [sourceId],
     );
     return rows;
   }
-  return engine.executeRaw<SourceRow>(
+  return maintenanceRaw<SourceRow>(
+    engine,
     `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL ORDER BY id`,
   );
 }

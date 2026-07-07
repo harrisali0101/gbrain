@@ -41,6 +41,8 @@ import { GBrainError } from '../types.ts';
 import type { OperationContext } from '../operations.ts';
 import type { BrainEngine, Take, TakeResolution } from '../engine.ts';
 import type { PhaseStatus, CyclePhase } from '../cycle.ts';
+// STAGE 2 batch A (2026-07-07): cross-source grade-cache reads/writes via admin pool.
+import { maintenanceRaw } from '../maintenance-query.ts';
 
 /**
  * Bump when the judge prompt or the JSON output shape changes. Old verdicts
@@ -440,7 +442,8 @@ class GradeTakesPhase extends BaseCyclePhase {
       const sig = evidenceSignature(evidence, judgeModelId);
 
       // Idempotency: skip when (take_id, prompt_version, judge_model_id, evidence_signature) exists.
-      const cached = await engine.executeRaw<{ verdict: string; confidence: number; applied: boolean }>(
+      const cached = await maintenanceRaw<{ verdict: string; confidence: number; applied: boolean }>(
+        engine,
         `SELECT verdict, confidence, applied FROM take_grade_cache
          WHERE take_id = $1 AND prompt_version = $2 AND judge_model_id = $3 AND evidence_signature = $4
          LIMIT 1`,
@@ -541,7 +544,8 @@ class GradeTakesPhase extends BaseCyclePhase {
 
       // Write the verdict to the cache. Idempotency conflict means another
       // run beat us to it; either way the row exists with consistent state.
-      await engine.executeRaw(
+      await maintenanceRaw(
+        engine,
         `INSERT INTO take_grade_cache
            (take_id, prompt_version, judge_model_id, evidence_signature, verdict, confidence, applied)
          VALUES ($1, $2, $3, $4, $5, $6, $7)

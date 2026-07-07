@@ -16,6 +16,8 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+// STAGE 2 batch A (2026-07-07): cross-source page reads via admin pool.
+import { maintenanceRaw } from '../maintenance-query.ts';
 import { BudgetMeter } from './budget-meter.ts';
 import { resolveModel } from '../model-config.ts';
 import type { DreamPhaseResult } from './auto-think.ts';
@@ -70,10 +72,10 @@ async function findDriftCandidates(
   const cutoffIso = new Date(cutoffMs).toISOString().slice(0, 10);
   // Only consider takes with weight in the "soft" middle band (0.3..0.85)
   // — facts (1.0) don't drift, very-low hunches (<0.3) aren't actionable yet.
-  const rows = await engine.executeRaw<{
+  const rows = await maintenanceRaw<{
     take_id: number; page_slug: string; row_num: number;
     claim: string; weight: number; recent_evidence: number;
-  }>(`
+  }>(engine, `
     SELECT t.id AS take_id, p.slug AS page_slug, t.row_num,
            t.claim, t.weight,
            (SELECT count(*)::int FROM timeline_entries te

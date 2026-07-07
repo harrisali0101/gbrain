@@ -24,6 +24,8 @@ import { join, relative, sep } from 'node:path';
 import type { BrainEngine, TakeBatchInput } from '../engine.ts';
 import { parseTakesFence, type ParsedTake } from '../takes-fence.ts';
 import { walkMarkdownFiles } from '../../commands/extract.ts';
+// STAGE 2 batch A (2026-07-07): cross-source takes reads/deletes via admin pool.
+import { maintenanceRaw } from '../maintenance-query.ts';
 
 export interface ExtractTakesOpts {
   /** Brain repo root. Required for source='fs'. */
@@ -70,7 +72,8 @@ export interface ExtractTakesResult {
  * that slug (e.g. file on disk that hasn't been imported yet).
  */
 async function getPageIdForSlug(engine: BrainEngine, slug: string): Promise<number | null> {
-  const rows = await engine.executeRaw<{ id: number }>(
+  const rows = await maintenanceRaw<{ id: number }>(
+    engine,
     `SELECT id FROM pages WHERE slug = $1 LIMIT 1`,
     [slug],
   );
@@ -159,7 +162,7 @@ export async function extractTakesFromFs(
     }
 
     if (opts.rebuild && !dryRun) {
-      await engine.executeRaw(`DELETE FROM takes WHERE page_id = $1`, [pageId]);
+      await maintenanceRaw(engine, `DELETE FROM takes WHERE page_id = $1`, [pageId]);
     }
 
     result.pagesWithTakes++;
@@ -219,7 +222,7 @@ export async function extractTakesFromDb(
     if (takes.length === 0) continue;
 
     if (opts.rebuild && !dryRun) {
-      await engine.executeRaw(`DELETE FROM takes WHERE page_id = $1`, [page.id]);
+      await maintenanceRaw(engine, `DELETE FROM takes WHERE page_id = $1`, [page.id]);
     }
 
     result.pagesWithTakes++;

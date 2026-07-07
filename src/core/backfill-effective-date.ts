@@ -28,6 +28,8 @@
 import type { BrainEngine } from './engine.ts';
 import { computeEffectiveDate } from './effective-date.ts';
 import type { EffectiveDateSource } from './types.ts';
+// STAGE 2 batch B (2026-07-07): cross-source config + page reads via admin pool.
+import { maintenanceRaw } from './maintenance-query.ts';
 
 const BATCH_SIZE = 1000;
 const CHECKPOINT_KEY = 'backfill.effective_date.last_id';
@@ -90,7 +92,8 @@ function parseFrontmatter(raw: unknown): Record<string, unknown> {
 async function getCheckpoint(engine: BrainEngine, fresh: boolean): Promise<number> {
   if (fresh) return 0;
   try {
-    const rows = await engine.executeRaw<{ value: string }>(
+    const rows = await maintenanceRaw<{ value: string }>(
+      engine,
       `SELECT value FROM config WHERE key = $1 LIMIT 1`,
       [CHECKPOINT_KEY],
     );
@@ -104,7 +107,8 @@ async function getCheckpoint(engine: BrainEngine, fresh: boolean): Promise<numbe
 
 async function setCheckpoint(engine: BrainEngine, lastId: number): Promise<void> {
   try {
-    await engine.executeRaw(
+    await maintenanceRaw(
+      engine,
       `INSERT INTO config (key, value) VALUES ($1, $2)
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
       [CHECKPOINT_KEY, String(lastId)],
@@ -117,7 +121,7 @@ async function setCheckpoint(engine: BrainEngine, lastId: number): Promise<void>
 
 async function clearCheckpoint(engine: BrainEngine): Promise<void> {
   try {
-    await engine.executeRaw(`DELETE FROM config WHERE key = $1`, [CHECKPOINT_KEY]);
+    await maintenanceRaw(engine, `DELETE FROM config WHERE key = $1`, [CHECKPOINT_KEY]);
   } catch {
     // Same — best effort.
   }
@@ -158,7 +162,8 @@ export async function backfillEffectiveDate(
     params.push(limit);
     const limitParam = `$${params.length}`;
 
-    const rows = await engine.executeRaw<PageRow>(
+    const rows = await maintenanceRaw<PageRow>(
+      engine,
       `SELECT id, slug, frontmatter, import_filename, effective_date, effective_date_source, created_at, updated_at
          FROM pages
          WHERE id > $1 ${slugFilter}

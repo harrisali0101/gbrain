@@ -47,6 +47,8 @@ import type { Page, PageFilters } from '../types.ts';
 import type { OperationContext } from '../operations.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseStatus, CyclePhase } from '../cycle.ts';
+// STAGE 2 batch A (2026-07-07): cross-source take_proposals reads/writes via admin pool.
+import { maintenanceRaw } from '../maintenance-query.ts';
 
 /**
  * Bump when the extractor prompt or the JSON output shape changes. Old
@@ -345,7 +347,8 @@ class ProposeTakesPhase extends BaseCyclePhase {
       // Idempotency check. If a row exists for (source_id, page_slug, content_hash,
       // prompt_version), this page was already processed — skip and count as cache hit.
       const sourceId = page.source_id ?? scope.sourceId ?? 'default';
-      const cached = await engine.executeRaw<{ id: number }>(
+      const cached = await maintenanceRaw<{ id: number }>(
+        engine,
         `SELECT id FROM take_proposals
          WHERE source_id = $1 AND page_slug = $2 AND content_hash = $3 AND prompt_version = $4
          LIMIT 1`,
@@ -390,7 +393,8 @@ class ProposeTakesPhase extends BaseCyclePhase {
       // because the composite idempotency key is on the per-page tuple — a
       // bulk UPSERT would collapse a same-page-multi-claim run into one row.
       for (const p of proposals) {
-        await engine.executeRaw(
+        await maintenanceRaw(
+          engine,
           `INSERT INTO take_proposals
              (source_id, page_slug, content_hash, prompt_version, proposal_run_id,
               claim_text, kind, holder, weight, domain, dedup_against_fence_rows, model_id)

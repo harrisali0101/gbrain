@@ -32,6 +32,8 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+// STAGE 2 batch A (2026-07-07): cross-source facts count via admin pool.
+import { maintenanceRaw } from '../maintenance-query.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { parseFactsFence } from '../facts-fence.ts';
@@ -117,7 +119,8 @@ export async function runExtractFacts(
   // entity_slug NOT NULL), refuse to run the destructive
   // reconciliation pass. The v0_32_2 orchestrator must complete
   // first.
-  const legacy = await engine.executeRaw<{ n: string }>(
+  const legacy = await maintenanceRaw<{ n: string }>(
+    engine,
     `SELECT COUNT(*) AS n FROM facts WHERE row_num IS NULL AND entity_slug IS NOT NULL`,
   );
   const legacyCount = parseInt(legacy[0]?.n ?? '0', 10);

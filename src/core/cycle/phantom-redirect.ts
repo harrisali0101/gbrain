@@ -40,6 +40,8 @@ import * as path from 'node:path';
 import { createHash } from 'node:crypto';
 
 import type { BrainEngine } from '../engine.ts';
+// STAGE 2 batch A (2026-07-07): cross-source page reads via admin pool.
+import { maintenanceRaw } from '../maintenance-query.ts';
 import type { Page } from '../types.ts';
 import {
   resolvePhantomCanonical,
@@ -547,7 +549,8 @@ export async function runPhantomRedirectPass(
   try {
     // Find unprefixed phantoms in this source. We over-fetch by 1 so
     // `more_pending` reflects whether the cap actually clipped work.
-    const rows = await engine.executeRaw<{ slug: string }>(
+    const rows = await maintenanceRaw<{ slug: string }>(
+      engine,
       `SELECT slug FROM pages
        WHERE source_id = $1
          AND deleted_at IS NULL

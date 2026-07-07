@@ -22,6 +22,8 @@ import { join, dirname } from 'node:path';
 import { mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult, PhaseError } from '../cycle.ts';
+// STAGE 2 batch A (2026-07-07): cross-source pattern reads via admin pool.
+import { maintenanceRaw } from '../maintenance-query.ts';
 import { MinionQueue } from '../minions/queue.ts';
 import { waitForCompletion, TimeoutError } from '../minions/wait-for-completion.ts';
 import type { MinionJobInput, SubagentHandlerData } from '../minions/types.ts';
@@ -171,7 +173,8 @@ async function gatherReflections(
   lookbackDays: number,
 ): Promise<ReflectionRef[]> {
   const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
-  const rows = await engine.executeRaw<{ slug: string; title: string | null; compiled_truth: string | null }>(
+  const rows = await maintenanceRaw<{ slug: string; title: string | null; compiled_truth: string | null }>(
+    engine,
     `SELECT slug, title, compiled_truth
        FROM pages
       WHERE slug LIKE 'wiki/personal/reflections/%'
@@ -231,7 +234,8 @@ async function collectChildPutPageSlugs(
   // dream cycles are a v0.33 follow-up. The point of threading source_id is
   // so reverseWriteRefs can pass it through getPage and pick the correct
   // (source_id, slug) row instead of whatever the DB happens to return.
-  const rows = await engine.executeRaw<{ slug: string }>(
+  const rows = await maintenanceRaw<{ slug: string }>(
+    engine,
     `SELECT DISTINCT
             COALESCE(input->>'slug', (input #>> '{}')::jsonb->>'slug') AS slug
        FROM subagent_tool_executions

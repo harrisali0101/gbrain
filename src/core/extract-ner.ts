@@ -17,8 +17,6 @@
 
 import type { BrainEngine } from './engine.ts';
 import type { LinkBatchInput } from './engine.ts';
-// STAGE 2 batch D (2026-07-07): cross-source reads via admin pool.
-import { maintenanceRaw } from './maintenance-query.ts';
 import { buildGazetteer, findMentionedEntities, type Gazetteer } from './by-mention.ts';
 import { inferLinkTypeFromPack } from './schema-pack/link-inference.ts';
 import { loadActivePackBestEffort } from './schema-pack/best-effort.ts';
@@ -203,8 +201,7 @@ export async function extractNerLinks(
 async function buildTargetTypeMap(engine: BrainEngine): Promise<Map<string, string>> {
   const map = new Map<string, string>();
   try {
-    const result = await maintenanceRaw<{ slug: string; source_id: string; type: string }>(
-      engine,
+    const result = await engine.executeRaw<{ slug: string; source_id: string; type: string }>(
       `SELECT slug, source_id, type FROM pages
          WHERE type IN ('person', 'company', 'organization', 'entity')
            AND deleted_at IS NULL`,

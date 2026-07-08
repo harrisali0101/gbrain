@@ -30,8 +30,6 @@ import {
   isValidOpenAITextEmbedding3Dim,
   maxOpenAITextEmbedding3Dim,
 } from './ai/dims.ts';
-// STAGE 2 batch D (2026-07-07): cross-source reads via admin pool.
-import { maintenanceRaw } from './maintenance-query.ts';
 
 /**
  * pgvector supports vector(N) columns up to 16000 dimensions. HNSW indexing
@@ -94,7 +92,7 @@ export interface ColumnDimResult {
  */
 export async function readContentChunksEmbeddingDim(engine: BrainEngine): Promise<ColumnDimResult> {
   // Probe column existence first to avoid noisy errors on fresh brains.
-  const existsRows = await maintenanceRaw<{ exists: boolean }>(engine,
+  const existsRows = await engine.executeRaw<{ exists: boolean }>(
     `SELECT EXISTS (
        SELECT 1 FROM information_schema.columns
        WHERE table_schema = 'public'
@@ -107,7 +105,7 @@ export async function readContentChunksEmbeddingDim(engine: BrainEngine): Promis
 
   // pgvector stores dim in pg_type.typmod when atttypmod is set; format_type
   // returns the human-readable `vector(N)`. We parse N out of that.
-  const formatRows = await maintenanceRaw<{ formatted: string | null }>(engine,
+  const formatRows = await engine.executeRaw<{ formatted: string | null }>(
     `SELECT format_type(a.atttypid, a.atttypmod) AS formatted
        FROM pg_attribute a
        JOIN pg_class c ON c.oid = a.attrelid
@@ -509,7 +507,7 @@ export async function readFactsEmbeddingDim(engine: BrainEngine): Promise<FactsC
   // Probe the embedding column directly. The facts table itself may
   // exist on a partial-v40 brain but without the embedding column on
   // very-old upgrade chains; both null branches yield exists:false.
-  const existsRows = await maintenanceRaw<{ exists: boolean }>(engine,
+  const existsRows = await engine.executeRaw<{ exists: boolean }>(
     `SELECT EXISTS (
        SELECT 1 FROM information_schema.columns
        WHERE table_schema = 'public'
@@ -520,7 +518,7 @@ export async function readFactsEmbeddingDim(engine: BrainEngine): Promise<FactsC
   const exists = !!existsRows?.[0]?.exists;
   if (!exists) return { exists: false, dims: null, columnType: null };
 
-  const formatRows = await maintenanceRaw<{ formatted: string | null }>(engine,
+  const formatRows = await engine.executeRaw<{ formatted: string | null }>(
     `SELECT format_type(a.atttypid, a.atttypmod) AS formatted
        FROM pg_attribute a
        JOIN pg_class c ON c.oid = a.attrelid

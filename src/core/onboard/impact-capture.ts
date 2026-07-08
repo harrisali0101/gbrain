@@ -17,9 +17,6 @@
 // misattribute deltas to the wrong remediation.
 
 import type { BrainEngine } from './../engine.ts';
-// STAGE 2 (2026-07-06): cross-source page reads route via the admin pool
-// so autopilot survives STAGE 4's drop of the runtime role default.
-import { maintenanceRaw } from '../maintenance-query.ts';
 
 export type MetricName =
   | 'orphan_count'
@@ -49,15 +46,13 @@ export async function captureMetric(
   try {
     switch (metric) {
       case 'stale_count': {
-        const rows = await maintenanceRaw<{ count: string | number }>(
-          engine,
+        const rows = await engine.executeRaw<{ count: string | number }>(
           `SELECT COUNT(*) AS count FROM content_chunks WHERE embedding IS NULL`,
         );
         return rows.length > 0 ? Number(rows[0].count) : 0;
       }
       case 'orphan_count': {
-        const rows = await maintenanceRaw<{ count: string | number }>(
-          engine,
+        const rows = await engine.executeRaw<{ count: string | number }>(
           `SELECT COUNT(*) AS count
              FROM pages p
             WHERE p.deleted_at IS NULL
@@ -68,8 +63,7 @@ export async function captureMetric(
       case 'entity_link_coverage':
       case 'timeline_coverage': {
         // Compute as a fraction of entity pages with the relevant feature.
-        const total = await maintenanceRaw<{ count: string | number }>(
-          engine,
+        const total = await engine.executeRaw<{ count: string | number }>(
           `SELECT COUNT(*) AS count FROM pages
              WHERE type IN ('person', 'company', 'organization', 'entity')
                AND deleted_at IS NULL`,
@@ -77,8 +71,7 @@ export async function captureMetric(
         const totalN = total.length > 0 ? Number(total[0].count) : 0;
         if (totalN === 0) return 1; // vacuous truth — empty brain has full coverage
         if (metric === 'entity_link_coverage') {
-          const withLinks = await maintenanceRaw<{ count: string | number }>(
-            engine,
+          const withLinks = await engine.executeRaw<{ count: string | number }>(
             `SELECT COUNT(*) AS count FROM pages p
                WHERE p.type IN ('person', 'company', 'organization', 'entity')
                  AND p.deleted_at IS NULL
@@ -86,8 +79,7 @@ export async function captureMetric(
           );
           return withLinks.length > 0 ? Number(withLinks[0].count) / totalN : 0;
         }
-        const withTimeline = await maintenanceRaw<{ count: string | number }>(
-          engine,
+        const withTimeline = await engine.executeRaw<{ count: string | number }>(
           `SELECT COUNT(*) AS count FROM pages p
              WHERE p.type IN ('person', 'company', 'organization', 'entity')
                AND p.deleted_at IS NULL
@@ -96,8 +88,7 @@ export async function captureMetric(
         return withTimeline.length > 0 ? Number(withTimeline[0].count) / totalN : 0;
       }
       case 'takes_count': {
-        const rows = await maintenanceRaw<{ count: string | number }>(
-          engine,
+        const rows = await engine.executeRaw<{ count: string | number }>(
           `SELECT COUNT(*) AS count FROM takes`,
         );
         return rows.length > 0 ? Number(rows[0].count) : 0;
@@ -124,8 +115,7 @@ export async function writeImpactLogRow(
   details?: Record<string, unknown>,
 ): Promise<void> {
   try {
-    await maintenanceRaw(
-      engine,
+    await engine.executeRaw(
       `INSERT INTO migration_impact_log (
          remediation_id, metric_name, metric_before, metric_after,
          job_id, source_id, brain_id, started_at, idempotency_key,

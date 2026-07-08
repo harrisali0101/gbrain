@@ -18,8 +18,6 @@
 
 import type { BrainEngine } from './engine.ts';
 import { isStatementTimeoutError, isRetryableConnError } from './retry-matcher.ts';
-// STAGE 2 batch B (2026-07-07): cross-source backfill config reads via admin pool.
-import { maintenanceRaw } from './maintenance-query.ts';
 // v0.41.18.0: swap inline setTimeout for shared abortableSleep so the sleep
 // primitive is unified across the codebase. Backfill's outer-loop + batch-
 // halving control flow stays intact (orthogonal to withRetry's per-call retry
@@ -114,8 +112,7 @@ function checkpointKey(name: string): string {
 async function getCheckpoint(engine: BrainEngine, name: string, fresh: boolean): Promise<number> {
   if (fresh) return 0;
   try {
-    const rows = await maintenanceRaw<{ value: string }>(
-      engine,
+    const rows = await engine.executeRaw<{ value: string }>(
       `SELECT value FROM config WHERE key = $1 LIMIT 1`,
       [checkpointKey(name)],
     );
@@ -146,8 +143,7 @@ export async function ensureBackfillIndex<TRow>(
   }
   const { name, sql } = spec.requiredIndex;
   try {
-    const rows = await maintenanceRaw<{ exists: boolean }>(
-      engine,
+    const rows = await engine.executeRaw<{ exists: boolean }>(
       `SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE indexname = $1) AS exists`,
       [name],
     );
@@ -205,8 +201,7 @@ export async function runBackfill<TRow = Record<string, unknown>>(
 
     let rows: TRow[];
     try {
-      rows = await maintenanceRaw<TRow>(
-        engine,
+      rows = await engine.executeRaw<TRow>(
         `SELECT ${cols.join(', ')} FROM ${spec.table}
          WHERE ${idCol} > $1 AND (${spec.needsBackfill})
          ORDER BY ${idCol}
@@ -335,7 +330,7 @@ export async function runBackfill<TRow = Record<string, unknown>>(
  */
 export async function clearBackfillCheckpoint(engine: BrainEngine, name: string): Promise<void> {
   try {
-    await maintenanceRaw(engine, `DELETE FROM config WHERE key = $1`, [checkpointKey(name)]);
+    await engine.executeRaw(`DELETE FROM config WHERE key = $1`, [checkpointKey(name)]);
   } catch {
     /* best-effort */
   }

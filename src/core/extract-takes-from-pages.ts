@@ -16,8 +16,6 @@
 import type { BrainEngine } from './engine.ts';
 import type { TakeBatchInput, TakeKind } from './engine.ts';
 import { chat, isAvailable } from './ai/gateway.ts';
-// STAGE 2 batch D (2026-07-07): cross-source reads via admin pool.
-import { maintenanceRaw } from './maintenance-query.ts';
 
 export const ALLOWED_PAGE_TYPES = [
   'concept', 'atom', 'lore', 'briefing', 'writing', 'originals',
@@ -134,7 +132,7 @@ export async function extractTakesFromPages(
   // Fetch eligible pages. Order by updated_at DESC so recently-edited
   // pages get bootstrapped first.
   const typesList = ALLOWED_PAGE_TYPES.map((t) => `'${t}'`).join(', ');
-  const pages = await maintenanceRaw<PageRow>(engine,
+  const pages = await engine.executeRaw<PageRow>(
     `SELECT id, slug, source_id, type, compiled_truth, updated_at
        FROM pages
       WHERE type IN (${typesList})

@@ -24,8 +24,6 @@
  * justify it; see `OPTS.useSnapshotIsolation`.
  */
 import type { BrainEngine } from '../engine.ts';
-// STAGE 2 batch D (2026-07-07): cross-source reads via admin pool.
-import { maintenanceRaw } from '../maintenance-query.ts';
 
 export interface CacheKey {
   symbol_qualified: string;
@@ -83,12 +81,11 @@ export async function getCachedTraversal<T>(
   key: CacheKey,
 ): Promise<CachedResponse<T> | null> {
   try {
-    const rows = await maintenanceRaw<{
+    const rows = await engine.executeRaw<{
       response_json: unknown;
       computed_at: string;
       cluster_generation: number;
     }>(
-      engine,
       `SELECT response_json, computed_at, cluster_generation
          FROM code_traversal_cache
         WHERE symbol_qualified = $1 AND depth = $2 AND source_id = $3
@@ -122,8 +119,7 @@ export async function putCachedTraversal<T>(
   xminMax: number,
 ): Promise<void> {
   try {
-    await maintenanceRaw(
-      engine,
+    await engine.executeRaw(
       `INSERT INTO code_traversal_cache
          (symbol_qualified, depth, source_id, response_json,
           max_chunk_updated_at, xmin_max, cluster_generation)
@@ -168,16 +164,14 @@ export async function clearTraversalCache(
     );
   }
   if (opts.allSources) {
-    const rows = await maintenanceRaw<{ count: string }>(
-      engine,
+    const rows = await engine.executeRaw<{ count: string }>(
       `WITH deleted AS (DELETE FROM code_traversal_cache RETURNING 1)
        SELECT COUNT(*)::text AS count FROM deleted`,
       [],
     );
     return parseInt(rows[0]?.count ?? '0', 10);
   }
-  const rows = await maintenanceRaw<{ count: string }>(
-    engine,
+  const rows = await engine.executeRaw<{ count: string }>(
     `WITH deleted AS (
        DELETE FROM code_traversal_cache WHERE source_id = $1 RETURNING 1
      )

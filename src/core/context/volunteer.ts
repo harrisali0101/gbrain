@@ -25,8 +25,6 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
-// STAGE 2 batch D (2026-07-07): cross-source reads via admin pool.
-import { maintenanceRaw } from '../maintenance-query.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
 import {
   extractCandidatesFromWindow,
@@ -232,8 +230,7 @@ export async function volunteerUsageStats(
   const safeDays = Number.isFinite(days) && days > 0 ? Math.floor(days) : 30;
   let rows: Array<{ match_arm: string; channel: string; volunteered: string | number; used: string | number }> = [];
   try {
-    rows = await maintenanceRaw(
-      engine,
+    rows = await engine.executeRaw(
       `SELECT e.match_arm, e.channel,
               count(*)::text AS volunteered,
               count(*) FILTER (WHERE p.last_retrieved_at > e.volunteered_at)::text AS used

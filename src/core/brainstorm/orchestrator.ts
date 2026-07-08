@@ -48,8 +48,6 @@ import {
 } from './judges.ts';
 import { canonicalLookup } from '../model-pricing.ts';
 import { ensureWellFormed } from '../text-safe.ts';
-// STAGE 2 batch D (2026-07-07): cross-source reads via admin pool.
-import { maintenanceRaw } from '../maintenance-query.ts';
 
 // ---------------------------------------------------------------------------
 // BudgetExhausted is the canonical typed error (Q2) used by every cost
@@ -338,7 +336,7 @@ export async function loadCalibrationContext(
     : '';
   let rows: Array<{ active_bias_tags: string[]; pattern_statements: string[] }>;
   try {
-    rows = await maintenanceRaw(engine,
+    rows = await engine.executeRaw(
       `SELECT active_bias_tags, pattern_statements
          FROM calibration_profiles
          WHERE holder = $1 ${sourceClause}

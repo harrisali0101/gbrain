@@ -61,8 +61,6 @@ import {
   type SynopsisFailureKind,
 } from './audit-synopsis.ts';
 import type { BrainEngine } from './engine.ts';
-// STAGE 2 batch E (2026-07-07): cross-source reads via admin pool.
-import { maintenanceRaw } from './maintenance-query.ts';
 import type { ChunkInput, CRMode, Page } from './types.ts';
 import type { SourceRow } from './sources-ops.ts';
 
@@ -540,8 +538,7 @@ function readSourceTextWithFallback(page: Page, chunks: ChunkInput[]): string {
 }
 
 async function loadSourceRow(engine: BrainEngine, sourceId: string): Promise<SourceRow> {
-  const rows = await maintenanceRaw<SourceRow>(
-    engine,
+  const rows = await engine.executeRaw<SourceRow>(
     `SELECT id, name, local_path, last_commit, last_sync_at, config, created_at,
             contextual_retrieval_mode, trust_frontmatter_overrides
      FROM sources WHERE id = $1`,

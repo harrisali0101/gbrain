@@ -14,8 +14,6 @@
  */
 
 import type { BrainEngine } from './engine.ts';
-// STAGE 2 batch C (2026-07-07): cross-source reads via admin pool.
-import { maintenanceRaw } from './maintenance-query.ts';
 
 // ── Types ───────────────────────────────────────────────────
 
@@ -56,8 +54,7 @@ export async function assessDestructiveImpact(
   sourceId: string,
 ): Promise<DestructiveImpact | null> {
   // Fetch source metadata
-  const sources = await maintenanceRaw<{ id: string; name: string }>(
-    engine,
+  const sources = await engine.executeRaw<{ id: string; name: string }>(
     `SELECT id, name FROM sources WHERE id = $1`,
     [sourceId],
   );
@@ -66,16 +63,14 @@ export async function assessDestructiveImpact(
   const src = sources[0];
 
   // Count pages
-  const pageRows = await maintenanceRaw<{ n: number }>(
-    engine,
+  const pageRows = await engine.executeRaw<{ n: number }>(
     `SELECT COUNT(*)::int AS n FROM pages WHERE source_id = $1`,
     [sourceId],
   );
   const pageCount = pageRows[0]?.n ?? 0;
 
   // Count chunks
-  const chunkRows = await maintenanceRaw<{ n: number }>(
-    engine,
+  const chunkRows = await engine.executeRaw<{ n: number }>(
     `SELECT COUNT(*)::int AS n FROM content_chunks cc
      JOIN pages p ON cc.page_id = p.id
      WHERE p.source_id = $1`,
@@ -84,8 +79,7 @@ export async function assessDestructiveImpact(
   const chunkCount = chunkRows[0]?.n ?? 0;
 
   // Count embeddings (chunks with non-null embedding vectors)
-  const embedRows = await maintenanceRaw<{ n: number }>(
-    engine,
+  const embedRows = await engine.executeRaw<{ n: number }>(
     `SELECT COUNT(*)::int AS n FROM content_chunks cc
      JOIN pages p ON cc.page_id = p.id
      WHERE p.source_id = $1 AND cc.embedding IS NOT NULL`,
@@ -97,16 +91,14 @@ export async function assessDestructiveImpact(
   // surface is Postgres-only (CLAUDE.md: "No files table" for PGLite). Probe
   // the table existence via information_schema so this works on both engines.
   let fileCount = 0;
-  const filesTableRows = await maintenanceRaw<{ exists: boolean }>(
-    engine,
+  const filesTableRows = await engine.executeRaw<{ exists: boolean }>(
     `SELECT EXISTS (
        SELECT 1 FROM information_schema.tables
        WHERE table_schema = 'public' AND table_name = 'files'
      ) AS exists`,
   );
   if (filesTableRows[0]?.exists) {
-    const fileRows = await maintenanceRaw<{ n: number }>(
-      engine,
+    const fileRows = await engine.executeRaw<{ n: number }>(
       `SELECT COUNT(*)::int AS n FROM files WHERE source_id = $1`,
       [sourceId],
     );
@@ -193,8 +185,7 @@ export async function softDeleteSource(
   // we need without a follow-up SELECT. RETURNING projects the columns the
   // caller cares about; pageCount is a separate count.
   const expiresClause = `now() + (${SOFT_DELETE_TTL_HOURS} || ' hours')::interval`;
-  const rows = await maintenanceRaw<{ id: string; name: string; archived_at: string; archive_expires_at: string }>(
-    engine,
+  const rows = await engine.executeRaw<{ id: string; name: string; archived_at: string; archive_expires_at: string }>(
     `UPDATE sources
      SET archived = true,
          archived_at = now(),
@@ -207,8 +198,7 @@ export async function softDeleteSource(
   if (rows.length === 0) return null;
   const row = rows[0];
 
-  const pageRows = await maintenanceRaw<{ n: number }>(
-    engine,
+  const pageRows = await engine.executeRaw<{ n: number }>(
     `SELECT COUNT(*)::int AS n FROM pages WHERE source_id = $1`,
     [sourceId],
   );
@@ -237,8 +227,7 @@ export async function restoreSource(
   refederate: boolean = true,
 ): Promise<boolean> {
   const federatedPatch = refederate ? '{"federated": true}' : '{"federated": false}';
-  const rows = await maintenanceRaw<{ id: string }>(
-    engine,
+  const rows = await engine.executeRaw<{ id: string }>(
     `UPDATE sources
      SET archived = false,
          archived_at = NULL,
@@ -261,14 +250,13 @@ export async function restoreSource(
 export async function listArchivedSources(
   engine: BrainEngine,
 ): Promise<SoftDeletedSource[]> {
-  const rows = await maintenanceRaw<{
+  const rows = await engine.executeRaw<{
     id: string;
     name: string;
     archived_at: string;
     archive_expires_at: string;
     page_count: number;
   }>(
-    engine,
     `SELECT
         s.id, s.name, s.archived_at, s.archive_expires_at,
         COALESCE((SELECT COUNT(*)::int FROM pages p WHERE p.source_id = s.id), 0) AS page_count
@@ -297,8 +285,7 @@ export async function listArchivedSources(
 export async function purgeExpiredSources(
   engine: BrainEngine,
 ): Promise<string[]> {
-  const rows = await maintenanceRaw<{ id: string }>(
-    engine,
+  const rows = await engine.executeRaw<{ id: string }>(
     `DELETE FROM sources
      WHERE archived = true
        AND archive_expires_at IS NOT NULL

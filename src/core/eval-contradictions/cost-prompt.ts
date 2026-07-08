@@ -27,8 +27,6 @@
 import type { BrainEngine } from '../engine.ts';
 import { estimateUpperBoundCost } from './cost-tracker.ts';
 import { PROMPT_VERSION } from './types.ts';
-// STAGE 2 batch D (2026-07-07): cross-source reads via admin pool.
-import { maintenanceRaw } from '../maintenance-query.ts';
 
 export interface CostPromptOpts {
   engine: BrainEngine;
@@ -52,7 +50,7 @@ export type CostPromptResult =
 /** Read the prompt_version of the most recent persisted run. */
 async function readLastPromptVersion(engine: BrainEngine): Promise<string | null> {
   try {
-    const rows = await maintenanceRaw<{ prompt_version: string }>(engine,
+    const rows = await engine.executeRaw<{ prompt_version: string }>(
       `SELECT prompt_version FROM eval_contradictions_runs ORDER BY ran_at DESC LIMIT 1`,
     );
     if (rows && rows.length > 0 && typeof rows[0].prompt_version === 'string') {

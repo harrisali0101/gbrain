@@ -27,8 +27,6 @@
  */
 
 import type { BrainEngine } from './engine.ts';
-// STAGE 2 batch D (2026-07-07): cross-source reads via admin pool.
-import { maintenanceRaw } from './maintenance-query.ts';
 import { stripCodeBlocks } from './link-extraction.ts';
 
 /** D2: hardcoded entity types for v1. Pack-aware extension is TODO-1. */
@@ -159,8 +157,7 @@ export async function buildGazetteer(
   opts: BuildGazetteerOpts = {},
 ): Promise<Gazetteer> {
   const typeList = LINKABLE_ENTITY_TYPES.map(t => `'${t}'`).join(', ');
-  const rows = await maintenanceRaw<{ slug: string; source_id: string | null; title: string | null }>(
-    engine,
+  const rows = await engine.executeRaw<{ slug: string; source_id: string | null; title: string | null }>(
     `SELECT slug, source_id, title
      FROM pages
      WHERE type IN (${typeList})

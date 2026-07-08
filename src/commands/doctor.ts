@@ -464,70 +464,6 @@ export async function childTableOrphansCheck(engine: BrainEngine): Promise<Check
   };
 }
 
-/**
- * DIH STAGE 2 (2026-07-06) invariant probe: hermesruntime should be
- * NOBYPASSRLS. Design memo:
- *   hermes-personal-agent/azure/design/hermes-postgres-role-split.md
- *
- * `ok` when hermesruntime lacks BYPASSRLS (RLS enforcement is PRIMARY —
- * the target state after the role split's Stage 2).
- * `warn` when hermesruntime still has BYPASSRLS (RLS is defense-only —
- * pre-split posture; scoped writes will still work but the pilot's
- * privilege-separation invariant is not yet in place).
- *
- * Skipped on non-Postgres engines (SQLite/PGLite/upstream): those have
- * no hermesruntime role. Failed lookups (e.g. Postgres without the DIH
- * role bootstrap) return `warn` with a note pointing at STAGE 1.
- *
- * Pure helper for parity with `takesWeightGridCheck` and
- * `childTableOrphansCheck` — tests target it directly without driving
- * the full `runDoctor` pipeline.
- */
-export async function runtimeRoleNoBypassRlsCheck(engine: BrainEngine): Promise<Check> {
-  const kind = (engine as unknown as { kind?: string }).kind;
-  if (kind !== 'postgres') {
-    return {
-      name: 'runtime_role_no_bypass_rls',
-      status: 'ok',
-      message: `Skipped: engine kind is ${kind ?? 'unknown'} (Postgres-only invariant).`,
-    };
-  }
-  try {
-    // pg_roles is the public view over pg_authid (minus rolpassword),
-    // readable by any role. pg_authid requires SUPERUSER (which
-    // hermesruntime does not have — that's the whole point of STAGE 2).
-    const rows = await engine.executeRaw<{ rolbypassrls: boolean }>(
-      `SELECT rolbypassrls FROM pg_roles WHERE rolname = 'hermesruntime'`,
-    );
-    if (rows.length === 0) {
-      return {
-        name: 'runtime_role_no_bypass_rls',
-        status: 'warn',
-        message:
-          "hermesruntime role not found — DIH STAGE 1 bootstrap has not been " +
-          "applied to this database, or the role has been renamed. See " +
-          "hermes-personal-agent/azure/sql/migrations/2026-07-05-add-hermesadmin-role.sql.",
-      };
-    }
-    const has = rows[0].rolbypassrls === true;
-    return {
-      name: 'runtime_role_no_bypass_rls',
-      status: has ? 'warn' : 'ok',
-      message: has
-        ? "hermesruntime has BYPASSRLS — RLS enforcement is defense-only. " +
-          "Target state after STAGE 2/3 is NOBYPASSRLS so RLS is primary."
-        : "hermesruntime is NOBYPASSRLS — RLS enforcement is primary (STAGE 2 target reached).",
-    };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return {
-      name: 'runtime_role_no_bypass_rls',
-      status: 'warn',
-      message: `Could not query pg_roles for hermesruntime.rolbypassrls: ${msg}`,
-    };
-  }
-}
-
 export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorReport> {
   const checks: Check[] = [];
 
@@ -6075,16 +6011,6 @@ export async function buildChecks(
   // surfaces them with paste-ready cleanup SQL.
   progress.heartbeat('child_table_orphans');
   checks.push(await childTableOrphansCheck(engine));
-
-  // 10d. DIH STAGE 2 (2026-07-06): runtime_role_no_bypass_rls — the
-  // hermesadmin / hermesruntime role split (design memo:
-  // hermes-personal-agent/azure/design/hermes-postgres-role-split.md)
-  // makes hermesruntime NOBYPASSRLS the target state — RLS enforcement
-  // becomes PRIMARY rather than defense-only. This probe records the
-  // invariant so drift is loud. Skipped when Postgres isn't the engine
-  // (SQLite / PGLite / upstream configs have no hermesruntime role).
-  progress.heartbeat('runtime_role_no_bypass_rls');
-  checks.push(await runtimeRoleNoBypassRlsCheck(engine));
 
   // v0.33: whoknows_health — fixture presence + row count. The eval
   // gate itself runs via `gbrain eval whoknows`; this check is the

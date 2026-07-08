@@ -36,8 +36,6 @@
 import type { BrainEngine } from './engine.ts';
 import { MinionQueue } from './minions/queue.ts';
 import { parseUsdLimit, resolveSpendPosture, type SpendPosture } from './spend-posture.ts';
-// STAGE 2 batch D (2026-07-07): cross-source reads via admin pool.
-import { maintenanceRaw } from './maintenance-query.ts';
 
 export const COOLDOWN_CONFIG_KEY = 'embed.backfill_cooldown_min';
 export const SPEND_CAP_CONFIG_KEY = 'embed.backfill_max_usd_per_source_24h';
@@ -108,7 +106,7 @@ async function defaultSpend24hForSource(
   // Conservative proxy: count jobs that completed (or are running) in the
   // 24h window. Each is treated as worth `DEFAULT_SPEND_CAP_USD / 25` ($1)
   // toward the cap — i.e. 25 jobs in 24h saturate the default cap.
-  const rows = await maintenanceRaw<{ n: number }>(engine,
+  const rows = await engine.executeRaw<{ n: number }>(
     `SELECT COUNT(*)::int AS n
        FROM minion_jobs
       WHERE name = 'embed-backfill'
@@ -156,10 +154,10 @@ export async function submitEmbedBackfill(
   // Block re-submission if (a) an embed-backfill is currently active for this
   // source, OR (b) the most-recent embed-backfill finished within the
   // cooldown window.
-  const lastJob = await maintenanceRaw<{
+  const lastJob = await engine.executeRaw<{
     finished_at: Date | null;
     status: string;
-  }>(engine,
+  }>(
     `SELECT finished_at, status
        FROM minion_jobs
       WHERE name = 'embed-backfill'

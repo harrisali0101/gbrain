@@ -36,8 +36,6 @@ import { AIConfigError } from '../ai/errors.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { hasAnthropicKey } from '../ai/anthropic-key.ts';
 import type { BrainEngine } from '../engine.ts';
-// STAGE 2 batch E (2026-07-07): cross-source reads via admin pool.
-import { maintenanceRaw } from '../maintenance-query.ts';
 
 /**
  * Test-seam transport. Real callers pass undefined → `gatewayChat`.
@@ -238,8 +236,7 @@ async function readDbCache<T>(engine: BrainEngine, key: string): Promise<T | nul
   // table's composite primary key.
   const [shape, model, contentSha] = splitCacheKey(key);
   if (!shape || !model || !contentSha) return null;
-  const rows = await maintenanceRaw(
-    engine,
+  const rows = await engine.executeRaw(
     `SELECT value_json FROM conversation_parser_llm_cache
        WHERE content_sha256 = $1 AND model_id = $2 AND call_shape = $3
        LIMIT 1`,
@@ -272,8 +269,7 @@ async function writeDbCache<T>(
   // #2339 class: this binds JSON.stringify(value) (a STRING) positionally, so it
   // must cast through $4::text::jsonb — a bare $4::jsonb double-encodes under
   // postgres.js .unsafe() (PGLite hides it). Pass a raw object to use $N::jsonb.
-  await maintenanceRaw(
-    engine,
+  await engine.executeRaw(
     `INSERT INTO conversation_parser_llm_cache
        (content_sha256, model_id, call_shape, value_json)
      VALUES ($1, $2, $3, $4::text::jsonb)

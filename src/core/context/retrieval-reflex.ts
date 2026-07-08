@@ -29,9 +29,6 @@ import { slugify } from '../entities/resolve.ts';
 import { stripTakesFence } from '../takes-fence.ts';
 import { stripFactsFence } from '../facts-fence.ts';
 import type { EntityCandidate } from './entity-salience.ts';
-// STAGE 2 (2026-07-06): cross-source page reads route via the admin pool
-// so autopilot survives STAGE 4's drop of the runtime role default.
-import { maintenanceRaw } from '../maintenance-query.ts';
 
 /** Default cap on pointers injected per turn (config: retrieval_reflex_max_pointers). */
 export const DEFAULT_MAX_POINTERS = 3;
@@ -205,8 +202,7 @@ export async function resolveEntitiesToPointers(
   // so a plain slug = ANY() misses. Match lower(title) exactly or the slug suffix.
   let rows: PageRow[] = [];
   try {
-    rows = await maintenanceRaw<PageRow>(
-      engine,
+    rows = await engine.executeRaw<PageRow>(
       `SELECT slug, source_id, title, type, frontmatter, compiled_truth
          FROM pages
         WHERE deleted_at IS NULL
@@ -225,8 +221,7 @@ export async function resolveEntitiesToPointers(
   const aliasOnly = resolved.filter((p) => !rowByKey.has(keyOf(p.source_id, p.slug)));
   if (aliasOnly.length) {
     try {
-      const extra = await maintenanceRaw<PageRow>(
-        engine,
+      const extra = await engine.executeRaw<PageRow>(
         `SELECT slug, source_id, title, type, frontmatter, compiled_truth
            FROM pages
           WHERE deleted_at IS NULL AND source_id = ANY($1::text[]) AND slug = ANY($2::text[])`,

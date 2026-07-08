@@ -19,8 +19,6 @@
 //   5. Write concept-typed pages.
 
 import type { BrainEngine } from '../engine.ts';
-// STAGE 2 batch A (2026-07-07): cross-source atom reads via admin pool.
-import { maintenanceRaw } from '../maintenance-query.ts';
 import type { PhaseResult } from '../cycle.ts';
 import type { ProgressReporter } from '../progress.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
@@ -73,13 +71,12 @@ export async function runPhaseSynthesizeConcepts(
   let atoms = opts._atoms ?? [];
   if (atoms.length === 0 && opts._atoms === undefined) {
     try {
-      const rows = await maintenanceRaw<{
+      const rows = await engine.executeRaw<{
         slug: string;
         title: string;
         compiled_truth: string;
         frontmatter: { concepts?: string[]; imported_from?: string };
       }>(
-        engine,
         `SELECT slug, title, compiled_truth, frontmatter
            FROM pages
           WHERE type = 'atom'

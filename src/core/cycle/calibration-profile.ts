@@ -36,8 +36,6 @@ import { aggregateDomainScorecards, type DomainScorecards } from '../calibration
 import { GBrainError } from '../types.ts';
 import type { OperationContext } from '../operations.ts';
 import type { BrainEngine, TakesScorecard } from '../engine.ts';
-// STAGE 2 batch A (2026-07-07): cross-source writes/reads via admin pool.
-import { maintenanceRaw } from '../maintenance-query.ts';
 import type { PhaseStatus, CyclePhase } from '../cycle.ts';
 
 export const CALIBRATION_PROFILE_PROMPT_VERSION = 'v0.36.1.0-stub';
@@ -349,8 +347,7 @@ class CalibrationProfilePhase extends BaseCyclePhase {
       );
     }
 
-    await maintenanceRaw(
-      engine,
+    await engine.executeRaw(
       `INSERT INTO calibration_profiles (
          source_id, holder, generated_at, published,
          total_resolved, brier, accuracy, partial_rate, grade_completion,

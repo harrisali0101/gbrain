@@ -41,8 +41,6 @@
  */
 
 import type { BrainEngine } from './engine.ts';
-// STAGE 2 batch E (2026-07-07): cross-source reads via admin pool.
-import { maintenanceRaw } from './maintenance-query.ts';
 import { EDGE_EXTRACTOR_VERSION_TS } from './chunkers/symbol-resolver.ts';
 
 export type CodeGraphStatus = 'not_built' | 'indexing' | 'ready' | 'unknown';
@@ -76,8 +74,7 @@ async function codeChunksExist(engine: BrainEngine, sourceId: string | undefined
     params.push(sourceId);
     scopeClause = `AND p.source_id = $${params.length}`;
   }
-  const rows = await maintenanceRaw<{ e: boolean }>(
-    engine,
+  const rows = await engine.executeRaw<{ e: boolean }>(
     `SELECT EXISTS(
        SELECT 1 FROM content_chunks cc
          JOIN pages p ON p.id = cc.page_id
@@ -96,8 +93,7 @@ async function pendingEdgeChunksExist(engine: BrainEngine, sourceId: string | un
     params.push(sourceId);
     scopeClause = `AND p.source_id = $${params.length}`;
   }
-  const rows = await maintenanceRaw<{ e: boolean }>(
-    engine,
+  const rows = await engine.executeRaw<{ e: boolean }>(
     `SELECT EXISTS(
        SELECT 1 FROM content_chunks cc
          JOIN pages p ON p.id = cc.page_id

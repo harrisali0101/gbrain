@@ -26,8 +26,6 @@ import type { BrainEngine, FactRow } from '../../engine.ts';
 import type { PhaseResult } from '../../cycle.ts';
 import { cosineSimilarity } from '../../facts/classify.ts';
 import { isAborted } from '../../abort-check.ts';
-// STAGE 2 batch A (2026-07-07): cross-source facts consolidation reads/writes via admin pool.
-import { maintenanceRaw } from '../../maintenance-query.ts';
 
 export interface ConsolidatePhaseOpts {
   dryRun?: boolean;
@@ -65,9 +63,9 @@ export async function runPhaseConsolidate(
   // Uses the partial idx_facts_unconsolidated index.
   let buckets: Array<{ source_id: string; entity_slug: string; count: number }>;
   try {
-    buckets = await maintenanceRaw<{
+    buckets = await engine.executeRaw<{
       source_id: string; entity_slug: string; count: number;
-    }>(engine, `
+    }>(`
       SELECT source_id, entity_slug, COUNT(*)::int AS count
       FROM facts
       WHERE consolidated_at IS NULL
@@ -125,8 +123,7 @@ export async function runPhaseConsolidate(
     const clusters = clusterFacts(unconsolidated, threshold);
 
     // Resolve entity_slug → page_id. If page missing in this source, skip.
-    const pageRows = await maintenanceRaw<{ id: number }>(
-      engine,
+    const pageRows = await engine.executeRaw<{ id: number }>(
       `SELECT id FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL LIMIT 1`,
       [b.source_id, b.entity_slug],
     );
@@ -134,8 +131,7 @@ export async function runPhaseConsolidate(
     const pageId = pageRows[0].id;
 
     // Existing row_num max for this page → start appending after it.
-    const rowMaxRows = await maintenanceRaw<{ max: number }>(
-      engine,
+    const rowMaxRows = await engine.executeRaw<{ max: number }>(
       `SELECT COALESCE(MAX(row_num), 0)::int AS max FROM takes WHERE page_id = $1`,
       [pageId],
     );
@@ -171,8 +167,7 @@ export async function runPhaseConsolidate(
       // `MAX(row_num)+1`, silently poisoning trajectory + scorecard data.
       // Match on (page_id, claim, since_date) — the natural identity of a
       // promoted take.
-      const existing = await maintenanceRaw<{ id: number }>(
-        engine,
+      const existing = await engine.executeRaw<{ id: number }>(
         `SELECT id FROM takes
          WHERE page_id = $1 AND claim = $2 AND since_date = $3
          LIMIT 1`,
@@ -186,8 +181,7 @@ export async function runPhaseConsolidate(
         // source_session values that the prior run didn't see); leave
         // row_num + weight untouched to keep the take's identity stable.
         takeId = existing[0].id;
-        await maintenanceRaw(
-          engine,
+        await engine.executeRaw(
           `UPDATE takes SET source = $1, updated_at = now() WHERE id = $2`,
           [sources.slice(0, 200), takeId],
         );
@@ -205,8 +199,7 @@ export async function runPhaseConsolidate(
         }]);
         if (inserted < 1) continue;
 
-        const idRows = await maintenanceRaw<{ id: number }>(
-          engine,
+        const idRows = await engine.executeRaw<{ id: number }>(
           `SELECT id FROM takes WHERE page_id = $1 AND row_num = $2`,
           [pageId, nextRowNum],
         );
@@ -244,8 +237,7 @@ export async function runPhaseConsolidate(
       for (let i = 0; i < chronological.length - 1; i++) {
         const older = chronological[i];
         const newer = chronological[i + 1];
-        await maintenanceRaw(
-          engine,
+        await engine.executeRaw(
           // Only UPDATE when the new value would actually change. Avoids
           // touching updated_at on no-op rewrites and keeps idempotency
           // observable in the DB (zero affected rows on stable re-run).

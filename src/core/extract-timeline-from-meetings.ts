@@ -12,8 +12,6 @@
 import type { BrainEngine } from './engine.ts';
 import type { TimelineBatchInput } from './engine.ts';
 import { buildGazetteer, findMentionedEntities, type Gazetteer } from './by-mention.ts';
-// STAGE 2 batch D (2026-07-07): cross-source reads via admin pool.
-import { maintenanceRaw } from './maintenance-query.ts';
 
 export interface ExtractTimelineFromMeetingsOpts {
   dryRun?: boolean;
@@ -70,7 +68,7 @@ export async function extractTimelineFromMeetings(
   // 1. Fetch all meeting pages (one round-trip).
   const sourceFilter = opts.sourceIdFilter ? `AND source_id = $1` : '';
   const meetingParams = opts.sourceIdFilter ? [opts.sourceIdFilter] : [];
-  const meetings = await maintenanceRaw<MeetingRow>(engine,
+  const meetings = await engine.executeRaw<MeetingRow>(
     `SELECT slug, source_id, title, effective_date, updated_at,
             compiled_truth, COALESCE(timeline, '') AS timeline
        FROM pages
@@ -89,7 +87,7 @@ export async function extractTimelineFromMeetings(
   // meeting source_ids). Build a Map<meetingSlug → attendees[]> for O(1)
   // attendee lookup per meeting.
   const meetingKeys = new Set(meetings.map((m) => `${m.source_id}::${m.slug}`));
-  const attendedEdges = await maintenanceRaw<AttendedEdgeRow>(engine,
+  const attendedEdges = await engine.executeRaw<AttendedEdgeRow>(
     `SELECT pf.slug AS from_slug, pf.source_id AS from_source_id,
             pt.slug AS to_slug, pt.source_id AS to_source_id
        FROM links l

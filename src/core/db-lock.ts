@@ -23,8 +23,6 @@
  */
 import { hostname } from 'os';
 import type { BrainEngine } from './engine.ts';
-// STAGE 2 batch C (2026-07-07): cross-source reads via admin pool.
-import { maintenanceRaw } from './maintenance-query.ts';
 
 export interface DbLockHandle {
   id: string;
@@ -918,7 +916,7 @@ export async function tryWithDbElection<T>(
 export async function buildTenantLockId(engine: BrainEngine, scope: string): Promise<string> {
   try {
     if (engine.kind === 'postgres') {
-      const rows = await maintenanceRaw<{ db: string }>(engine, 'SELECT current_database() AS db');
+      const rows = await engine.executeRaw<{ db: string }>('SELECT current_database() AS db');
       const dbname = rows[0]?.db || 'unknown';
       return `${scope}:${dbname}`;
     }

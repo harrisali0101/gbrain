@@ -24,10 +24,6 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
-// STAGE 2 batch B (2026-07-07): cross-source budget-ledger reads via admin pool.
-// Note: writes inside withReservedConnection/transaction (tx.executeRaw) stay
-// unchanged — their pool routing is managed by the caller's wrapper.
-import { maintenanceRaw } from '../maintenance-query.ts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -291,8 +287,7 @@ export class BudgetLedger {
   /** Read current state for (scope, resolverId, date=today). */
   async state(scope: string, resolverId: string): Promise<BudgetStateRow | null> {
     const date = todayInTz(this.tz);
-    const rows = await maintenanceRaw<{ reserved_usd: string | number; committed_usd: string | number; cap_usd: string | number | null }>(
-      this.engine,
+    const rows = await this.engine.executeRaw<{ reserved_usd: string | number; committed_usd: string | number; cap_usd: string | number | null }>(
       `SELECT reserved_usd, committed_usd, cap_usd
        FROM budget_ledger
        WHERE scope = $1 AND resolver_id = $2 AND local_date = $3`,
@@ -312,8 +307,7 @@ export class BudgetLedger {
 
   /** Global sweep for TTL-expired held reservations. Safe to run anytime. */
   async cleanupExpired(): Promise<{ reclaimed: number }> {
-    const expired = await maintenanceRaw<{ reservation_id: string; scope: string; resolver_id: string; local_date: string; estimate_usd: string | number }>(
-      this.engine,
+    const expired = await this.engine.executeRaw<{ reservation_id: string; scope: string; resolver_id: string; local_date: string; estimate_usd: string | number }>(
       `SELECT reservation_id, scope, resolver_id, local_date, estimate_usd
        FROM budget_reservations
        WHERE status = 'held' AND expires_at < now()`,
@@ -332,8 +326,7 @@ export class BudgetLedger {
   }
 
   private async reclaimExpiredRow(scope: string, resolverId: string, date: string): Promise<void> {
-    const expired = await maintenanceRaw<{ reservation_id: string }>(
-      this.engine,
+    const expired = await this.engine.executeRaw<{ reservation_id: string }>(
       `SELECT reservation_id FROM budget_reservations
        WHERE scope = $1 AND resolver_id = $2 AND local_date = $3
          AND status = 'held' AND expires_at < now()`,

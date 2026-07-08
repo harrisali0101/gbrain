@@ -35,8 +35,6 @@ import { hasAnthropicKey } from '../ai/anthropic-key.ts';
 import { join, dirname, isAbsolute, resolve } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult, PhaseError } from '../cycle.ts';
-// STAGE 2 batch A (2026-07-07): cross-source job/legacy reads via admin pool.
-import { maintenanceRaw } from '../maintenance-query.ts';
 import { MinionQueue } from '../minions/queue.ts';
 import { waitForCompletion, TimeoutError } from '../minions/wait-for-completion.ts';
 import type { MinionJobInput, SubagentHandlerData } from '../minions/types.ts';
@@ -1026,8 +1024,7 @@ async function collectChildPutPageSlugs(
   // product behavior. Threading the source_id through reverseWriteRefs
   // guarantees getPage targets the correct (source, slug) row instead of
   // the first DB match.
-  const rows = await maintenanceRaw<{ job_id: number; slug: string }>(
-    engine,
+  const rows = await engine.executeRaw<{ job_id: number; slug: string }>(
     `SELECT job_id,
             COALESCE(input->>'slug', (input #>> '{}')::jsonb->>'slug') AS slug
        FROM subagent_tool_executions
@@ -1060,8 +1057,7 @@ async function hasLegacySingleChunkCompletion(
   hash16: string,
 ): Promise<boolean> {
   const legacyKey = `dream:synth:${filePath}:${hash16}`;
-  const rows = await maintenanceRaw<{ status: string }>(
-    engine,
+  const rows = await engine.executeRaw<{ status: string }>(
     `SELECT status
        FROM minion_jobs
       WHERE idempotency_key = $1

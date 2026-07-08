@@ -42,8 +42,6 @@ import { gbrainPath } from '../config.ts';
 import { upsertFactRow, parseFactsFence } from '../facts-fence.ts';
 import { extractFactsFromFenceText } from './extract-from-fence.ts';
 import { logStubGuardEvent } from './stub-guard-audit.ts';
-// STAGE 2 batch D (2026-07-07): cross-source reads via admin pool.
-import { maintenanceRaw } from '../maintenance-query.ts';
 
 /** Resolved source binding for the entity page. */
 export interface FenceTarget {
@@ -291,7 +289,7 @@ export async function lookupSourceLocalPath(
   engine: BrainEngine,
   sourceId: string,
 ): Promise<string | null> {
-  const rows = await maintenanceRaw<{ local_path: string | null }>(engine,
+  const rows = await engine.executeRaw<{ local_path: string | null }>(
     `SELECT local_path FROM sources WHERE id = $1 LIMIT 1`,
     [sourceId],
   );

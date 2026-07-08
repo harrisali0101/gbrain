@@ -18,8 +18,6 @@
 
 import type { BrainEngine } from '../engine.ts';
 import type { AggregatorKind, CalibrationDomain } from '../schema-pack/manifest-v1.ts';
-// STAGE 2 batch C (2026-07-07): cross-source reads via admin pool.
-import { maintenanceRaw } from '../maintenance-query.ts';
 
 export interface DomainScorecard {
   /** Number of resolved takes contributing to this scorecard. */
@@ -106,12 +104,11 @@ async function aggregateScalarBrier(
   domain: CalibrationDomain,
   sourceId: string,
 ): Promise<DomainScorecard> {
-  const rows = await maintenanceRaw<{
+  const rows = await engine.executeRaw<{
     n: number;
     brier: number | null;
     accuracy: number | null;
   }>(
-    engine,
     `SELECT
        COUNT(*)::int AS n,
        AVG(POWER(t.weight - (t.resolved_outcome::int)::real, 2))::real AS brier,
@@ -150,12 +147,11 @@ async function aggregateWeightedBrier(
   domain: CalibrationDomain,
   sourceId: string,
 ): Promise<DomainScorecard> {
-  const rows = await maintenanceRaw<{
+  const rows = await engine.executeRaw<{
     n: number;
     brier: number | null;
     accuracy: number | null;
   }>(
-    engine,
     `WITH scored AS (
        SELECT
          POWER(t.weight - (t.resolved_outcome::int)::real, 2) AS sq_err,
@@ -199,8 +195,7 @@ async function aggregateCountBased(
   domain: CalibrationDomain,
   sourceId: string,
 ): Promise<DomainScorecard> {
-  const rows = await maintenanceRaw<{ n: number; accuracy: number | null }>(
-    engine,
+  const rows = await engine.executeRaw<{ n: number; accuracy: number | null }>(
     `SELECT
        COUNT(*)::int AS n,
        (SUM(CASE WHEN (t.weight >= 0.5) = t.resolved_outcome THEN 1 ELSE 0 END)::real
@@ -244,14 +239,13 @@ async function aggregateClusterSummary(
 ): Promise<DomainScorecard> {
   // For cluster_summary, "holder" is informational only — concepts aren't
   // owned by a holder the way takes are. We still scope by source.
-  const rows = await maintenanceRaw<{
+  const rows = await engine.executeRaw<{
     n: number;
     t1: number;
     t2: number;
     t3: number;
     t4: number;
   }>(
-    engine,
     `SELECT
        COUNT(*)::int AS n,
        SUM(CASE WHEN frontmatter->>'tier' = 'T1' OR frontmatter->>'tier' = '1' THEN 1 ELSE 0 END)::int AS t1,
